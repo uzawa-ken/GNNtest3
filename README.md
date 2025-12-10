@@ -8,7 +8,8 @@ OpenFOAM の数値解析結果を用いてグラフニューラルネットワ�
 
 ### 主な特徴
 
-- **自動データ検出**: 指定ディレクトリから複数タイムステップのデータを自動的に検出
+- **複数プロセス対応**: MPI 並列計算で生成された複数 rank のデータを統合して学習
+- **自動データ検出**: 指定ディレクトリから全ての (time, rank) ペアを自動的に検出
 - **物理ベース学習**: PDE 残差を損失関数に組み込むことで物理的整合性を確保
 - **メッシュ品質適応**: スキュー、非直交性、アスペクト比などのメッシュ品質指標に基づいて学習重みを動的に調整
 - **リアルタイム可視化**: 訓練過程をリアルタイムでグラフ表示
@@ -34,13 +35,28 @@ pip install matplotlib
 
 ```
 GNNtest3/
-├── README.md                      # このファイル
-├── GNN_train_val_weight.py        # メインスクリプト
-└── gnn/                           # データディレクトリ（要作成）
-    ├── pEqn_{time}_rank{N}.dat    # PDE 方程式情報
-    ├── x_{time}_rank{N}.dat       # OpenFOAM の解（正解データ）
-    └── A_csr_{time}.dat           # 係数行列（CSR 形式）
+├── README.md                          # このファイル
+├── GNN_train_val_weight.py            # メインスクリプト
+└── data/                              # データディレクトリ（要作成）
+    ├── pEqn_{time}_rank0.dat          # rank 0 の PDE 方程式情報
+    ├── pEqn_{time}_rank1.dat          # rank 1 の PDE 方程式情報
+    ├── ...                            # 他の rank のファイル
+    ├── x_{time}_rank0.dat             # rank 0 の OpenFOAM 解
+    ├── x_{time}_rank1.dat             # rank 1 の OpenFOAM 解
+    ├── ...
+    ├── A_csr_{time}_rank0.dat         # rank 0 の係数行列（CSR 形式）
+    ├── A_csr_{time}_rank1.dat         # rank 1 の係数行列（CSR 形式）
+    └── ...
 ```
+
+### 複数プロセス対応
+
+本プログラムは MPI 並列計算で領域分割された OpenFOAM の結果に対応しています：
+
+- 各 rank（プロセス）のデータは独立したグラフとして扱われます
+- 全ての rank のデータを自動検出し、統合して学習を行います
+- 各 rank は異なるセル数を持つことができます
+- (time, rank) ペアを単位として train/val 分割を行います
 
 ## データ形式
 
@@ -72,9 +88,9 @@ OpenFOAM で計算された圧力値（正解データ）です。
 ...
 ```
 
-### CSR 行列ファイル（`A_csr_{time}.dat`）
+### CSR 行列ファイル（`A_csr_{time}_rank{N}.dat`）
 
-PDE の係数行列を CSR（Compressed Sparse Row）形式で格納したファイルです。
+PDE の係数行列を CSR（Compressed Sparse Row）形式で格納したファイルです。各 rank ごとに独立したファイルが必要です。
 
 ```
 nRows {行数}
@@ -92,7 +108,7 @@ VALUES
 
 ### 1. データの準備
 
-OpenFOAM の解析結果から上記形式のデータファイルを生成し、`./gnn` ディレクトリに配置してください。
+OpenFOAM の解析結果から上記形式のデータファイルを生成し、`./data` ディレクトリに配置してください。全ての rank のファイルを同一ディレクトリに配置します。
 
 ### 2. 設定の調整
 
@@ -100,17 +116,14 @@ OpenFOAM の解析結果から上記形式のデータファイルを生成し�
 
 ```python
 # データディレクトリ
-DATA_DIR       = "./gnn"
+DATA_DIR       = "./data"
 OUTPUT_DIR     = "./"
-
-# MPI ランク（並列計算の場合）
-RANK_STR       = "7"
 
 # 学習パラメータ
 NUM_EPOCHS     = 1000          # エポック数
 LR             = 1e-3          # 学習率
 WEIGHT_DECAY   = 1e-5          # L2 正則化
-MAX_NUM_CASES  = 100           # 使用するケース数の上限
+MAX_NUM_CASES  = 100           # 使用する (time, rank) ペア数の上限
 TRAIN_FRACTION = 0.8           # 訓練データの割合
 
 # 損失関数の重み
@@ -123,6 +136,12 @@ LAMBDA_PDE  = 0.0001           # PDE 損失の重み
 ```bash
 python GNN_train_val_weight.py
 ```
+
+実行時に以下の情報がログ出力されます：
+- 検出された rank 一覧
+- 検出された time 一覧
+- 使用する (time, rank) ペアの総数
+- train/val 分割の詳細
 
 ## モデルアーキテクチャ
 
@@ -185,8 +204,8 @@ L_pde = Σ w_i × |r_i|² / (Σ w_i × |b_i|² + ε)
 |-----------|------|
 | `log_DATA{λ1}_PDE{λ2}.txt` | 訓練ログ（エポックごとの損失値など） |
 | `training_history_DATA{λ1}_PDE{λ2}.png` | 訓練曲線のグラフ |
-| `x_pred_train_{time}_rank{N}.dat` | 訓練データの予測結果 |
-| `x_pred_val_{time}_rank{N}.dat` | 検証データの予測結果 |
+| `x_pred_train_{time}_rank{N}.dat` | 訓練データの予測結果（各 rank ごと） |
+| `x_pred_val_{time}_rank{N}.dat` | 検証データの予測結果（各 rank ごと） |
 
 ## 技術的詳細
 
@@ -204,6 +223,12 @@ w_pde = min(w_pde, W_PDE_MAX)  # 上限は 10.0
 ### CSR 行列演算
 
 係数行列 A はメモリ効率のため CSR 形式で保持し、`matvec_csr_torch` 関数で行列-ベクトル積を計算します。
+
+### 複数 rank の統合学習
+
+- 各 rank のグラフは独立したサンプルとして扱われます
+- 正規化統計量（平均・標準偏差）は全 rank のデータから計算されます
+- 各エポックで全ての (time, rank) ケースを用いて損失を計算し、モデルを更新します
 
 ## ライセンス
 

@@ -4,9 +4,10 @@
 """
 train_gnn_auto_trainval_pde_weighted.py
 
-- DATA_DIR 内から自動的に pEqn_*_rank{RANK_STR}.dat を走査し、
-  TIME_LIST を最大 MAX_NUM_CASES 件まで自動生成。
-- その TIME_LIST を train/val に分割して学習。
+- DATA_DIR 内から自動的に pEqn_*_rank*.dat を走査し、
+  全ての (time, rank) ペアを最大 MAX_NUM_CASES 件まで自動生成。
+- 複数プロセス（rank）のデータを統合して学習。
+- その (time, rank) リストを train/val に分割して学習。
 - 損失は data loss (相対二乗誤差) + mesh-quality-weighted PDE loss。
 - 学習中に、loss / data_loss / PDE_loss / rel_err_train / rel_err_val を
   リアルタイムにポップアップ表示。
@@ -39,10 +40,8 @@ except ImportError:
 # 設定
 # ------------------------------------------------------------
 
-DATA_DIR       = "./gnn"
+DATA_DIR       = "./data"
 OUTPUT_DIR     = "./"
-
-RANK_STR       = "2"
 NUM_EPOCHS     = 1000
 LR             = 1e-3
 WEIGHT_DECAY   = 1e-5
@@ -75,29 +74,40 @@ def log_print(msg: str):
         LOGGER_FILE.flush()
 
 # ------------------------------------------------------------
-# ユーティリティ: time list 自動検出
+# ユーティリティ: (time, rank) ペアリスト自動検出
 # ------------------------------------------------------------
 
-def find_time_list(data_dir: str, rank_str: str):
-    times = []
+import re
+
+def find_time_rank_list(data_dir: str):
+    """
+    DATA_DIR 内から全ての pEqn_{time}_rank{rank}.dat を走査し、
+    対応する x_{time}_rank{rank}.dat と A_csr_{time}_rank{rank}.dat が
+    存在する (time, rank) ペアのリストを返す。
+    """
+    time_rank_pairs = []
+    pattern = re.compile(r"^pEqn_(.+)_rank(\d+)\.dat$")
+
     for fn in os.listdir(data_dir):
-        if not fn.startswith("pEqn_"):
-            continue
-        if not fn.endswith(f"_rank{rank_str}.dat"):
+        match = pattern.match(fn)
+        if not match:
             continue
 
-        core = fn[len("pEqn_") : -len(f"_rank{rank_str}.dat")]
-        time_str = core
+        time_str = match.group(1)
+        rank_str = match.group(2)
 
         x_path   = os.path.join(data_dir, f"x_{time_str}_rank{rank_str}.dat")
-        # ★ 修正ポイント
         csr_path = os.path.join(data_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
 
         if os.path.exists(x_path) and os.path.exists(csr_path):
-            times.append(time_str)
+            time_rank_pairs.append((time_str, rank_str))
 
-    times = sorted(set(times), key=lambda s: float(s))
-    return times
+    # time の数値順、次に rank の数値順でソート
+    time_rank_pairs = sorted(
+        set(time_rank_pairs),
+        key=lambda tr: (float(tr[0]), int(tr[1]))
+    )
+    return time_rank_pairs
 
 
 # ------------------------------------------------------------
@@ -107,7 +117,6 @@ def find_time_list(data_dir: str, rank_str: str):
 def load_case_with_csr(data_dir: str, time_str: str, rank_str: str):
     p_path   = os.path.join(data_dir, f"pEqn_{time_str}_rank{rank_str}.dat")
     x_path   = os.path.join(data_dir, f"x_{time_str}_rank{rank_str}.dat")
-    # ★ 修正ポイント
     csr_path = os.path.join(data_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
 
     if not os.path.exists(p_path):
@@ -277,6 +286,7 @@ def load_case_with_csr(data_dir: str, time_str: str, rank_str: str):
 
     return {
         "time": time_str,
+        "rank": rank_str,
         "feats_np": feats_np,
         "edge_index_np": edge_index_np,
         "x_true_np": x_true_np,
@@ -386,6 +396,7 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
 
     return {
         "time": rc["time"],
+        "rank": rc["rank"],
         "feats": feats,
         "edge_index": edge_index,
         "x_true": x_true,
@@ -511,34 +522,40 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
     log_print(f"[INFO] Logging to {log_path}")
     log_print(f"[INFO] device = {device}")
 
-    # --- time list 検出 & 分割 ---
-    all_times = find_time_list(data_dir, RANK_STR)
-    if not all_times:
+    # --- (time, rank) ペアリスト検出 & 分割 ---
+    all_time_rank_pairs = find_time_rank_list(data_dir)
+    if not all_time_rank_pairs:
         raise RuntimeError(
-            f"{data_dir} 内に pEqn_*_rank{RANK_STR}.dat / x_* / A_csr_* が見つかりませんでした。"
+            f"{data_dir} 内に pEqn_*_rank*.dat / x_*_rank*.dat / A_csr_*_rank*.dat が見つかりませんでした。"
         )
+
+    # 検出されたランクの一覧をログ出力
+    all_ranks = sorted(set(r for _, r in all_time_rank_pairs), key=int)
+    all_times_unique = sorted(set(t for t, _ in all_time_rank_pairs), key=float)
+    log_print(f"[INFO] 検出された rank 一覧: {all_ranks}")
+    log_print(f"[INFO] 検出された time 一覧: {all_times_unique[:10]}{'...' if len(all_times_unique) > 10 else ''}")
 
     # 以降の print(...) はすべて log_print(...) に置き換え
     random.seed(RANDOM_SEED)
-    random.shuffle(all_times)
+    random.shuffle(all_time_rank_pairs)
 
-    all_times = all_times[:MAX_NUM_CASES]
-    n_total = len(all_times)
+    all_time_rank_pairs = all_time_rank_pairs[:MAX_NUM_CASES]
+    n_total = len(all_time_rank_pairs)
     n_train = max(1, int(n_total * TRAIN_FRACTION))
     n_val   = n_total - n_train
 
-    time_train = all_times[:n_train]
-    time_val   = all_times[n_train:]
+    pairs_train = all_time_rank_pairs[:n_train]
+    pairs_val   = all_time_rank_pairs[n_train:]
 
-    log_print(f"[INFO] 検出された time 数 (使用分) = {n_total}")
+    log_print(f"[INFO] 検出された (time, rank) ペア数 (使用分) = {n_total}")
     log_print(f"[INFO] train: {n_train} cases, val: {n_val} cases (TRAIN_FRACTION={TRAIN_FRACTION})")
     log_print("=== 使用する train ケース (time, rank) ===")
-    for t in time_train:
-        log_print(f"  time={t}, rank={RANK_STR}")
+    for t, r in pairs_train:
+        log_print(f"  time={t}, rank={r}")
     log_print("=== 使用する val ケース (time, rank) ===")
-    if time_val:
-        for t in time_val:
-            log_print(f"  time={t}, rank={RANK_STR}")
+    if pairs_val:
+        for t, r in pairs_val:
+            log_print(f"  time={t}, rank={r}")
     else:
         log_print("  (val ケースなし)")
     log_print("===========================================")
@@ -548,23 +565,23 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
     raw_cases_train = []
     raw_cases_val   = []
 
-    train_set = set(time_train)
-    for t in all_times:
-        log_print(f"[LOAD] time={t}, rank={RANK_STR} のグラフ+PDE情報を読み込み中...")
-        rc = load_case_with_csr(data_dir, t, RANK_STR)
-        if t in train_set:
+    train_set = set(pairs_train)
+    for t, r in all_time_rank_pairs:
+        log_print(f"[LOAD] time={t}, rank={r} のグラフ+PDE情報を読み込み中...")
+        rc = load_case_with_csr(data_dir, t, r)
+        if (t, r) in train_set:
             raw_cases_train.append(rc)
         else:
             raw_cases_val.append(rc)
 
-    # 一貫性チェック
-    nCells0 = raw_cases_train[0]["feats_np"].shape[0]
-    nFeat   = raw_cases_train[0]["feats_np"].shape[1]
+    # 特徴量次元数の一貫性チェック（セル数は rank ごとに異なる可能性あり）
+    nFeat = raw_cases_train[0]["feats_np"].shape[1]
     for rc in raw_cases_train + raw_cases_val:
-        if rc["feats_np"].shape[0] != nCells0 or rc["feats_np"].shape[1] != nFeat:
-            raise RuntimeError("全ケースで nCells/nFeatures が一致していません。")
+        if rc["feats_np"].shape[1] != nFeat:
+            raise RuntimeError("全ケースで nFeatures が一致していません。")
 
-    log_print(f"[INFO] nCells (1 ケース目) = {nCells0}, nFeatures = {nFeat}")
+    total_cells = sum(rc["feats_np"].shape[0] for rc in raw_cases_train + raw_cases_val)
+    log_print(f"[INFO] nFeatures = {nFeat}, 総セル数 (全ケース合計) = {total_cells}")
 
     # --- グローバル正規化: train+val 全体で統計を取る ---
     all_feats = np.concatenate(
@@ -827,6 +844,7 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
     model.eval()
     for cs in cases_train:
         time_str   = cs["time"]
+        rank_str   = cs["rank"]
         feats      = cs["feats"]
         edge_index = cs["edge_index"]
         x_true     = cs["x_true"]
@@ -876,7 +894,7 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
             R_true_over_Ax = norm_r_true / (norm_Ax_true + EPS_RES)
 
         log_print(
-            f"  [train] Case (time={time_str}, rank={RANK_STR}): "
+            f"  [train] Case (time={time_str}, rank={rank_str}): "
             f"rel_err = {rel_err.item():.4e}, RMSE = {rmse.item():.4e}, "
             f"R_pred(weighted) = {R_pred_w.item():.4e}"
         )
@@ -907,7 +925,7 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
 
         # 予測結果の書き出し
         x_pred_np = x_pred.cpu().numpy().reshape(-1)
-        out_path = os.path.join(OUTPUT_DIR, f"x_pred_train_{time_str}_rank{RANK_STR}.dat")
+        out_path = os.path.join(OUTPUT_DIR, f"x_pred_train_{time_str}_rank{rank_str}.dat")
         with open(out_path, "w") as f:
             for i, val in enumerate(x_pred_np):
                 f.write(f"{i} {val:.9e}\n")
@@ -917,6 +935,7 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
         log_print("\n=== Final diagnostics (val cases) ===")
         for cs in cases_val:
             time_str   = cs["time"]
+            rank_str   = cs["rank"]
             feats      = cs["feats"]
             edge_index = cs["edge_index"]
             x_true     = cs["x_true"]
@@ -963,7 +982,7 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
                 R_true_over_Ax = norm_r_true / (norm_Ax_true + EPS_RES)
 
             log_print(
-                f"  [val]   Case (time={time_str}, rank={RANK_STR}): "
+                f"  [val]   Case (time={time_str}, rank={rank_str}): "
                 f"rel_err = {rel_err.item():.4e}, RMSE = {rmse.item():.4e}, "
                 f"R_pred(weighted) = {R_pred_w.item():.4e}"
             )
@@ -993,7 +1012,7 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
             )
 
             x_pred_np = x_pred.cpu().numpy().reshape(-1)
-            out_path = os.path.join(OUTPUT_DIR, f"x_pred_val_{time_str}_rank{RANK_STR}.dat")
+            out_path = os.path.join(OUTPUT_DIR, f"x_pred_val_{time_str}_rank{rank_str}.dat")
             with open(out_path, "w") as f:
                 for i, val in enumerate(x_pred_np):
                     f.write(f"{i} {val:.9e}\n")
