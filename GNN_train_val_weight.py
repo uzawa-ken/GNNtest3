@@ -115,10 +115,13 @@ def find_time_rank_list(data_dir: str):
             rank_str = match.group(2)
 
             x_path   = os.path.join(gnn_dir, f"x_{time_str}_rank{rank_str}.dat")
+            # CSR ファイルは A_csr_{time}.dat または A_csr_{time}_rank{rank}.dat の両形式に対応
             csr_path = os.path.join(gnn_dir, f"A_csr_{time_str}.dat")
+            csr_path_with_rank = os.path.join(gnn_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
 
-            if os.path.exists(x_path) and os.path.exists(csr_path):
-                time_rank_tuples.append((time_str, rank_str, gnn_dir))
+            if os.path.exists(x_path):
+                if os.path.exists(csr_path) or os.path.exists(csr_path_with_rank):
+                    time_rank_tuples.append((time_str, rank_str, gnn_dir))
 
     # time の数値順、次に rank の数値順でソート
     time_rank_tuples = sorted(
@@ -139,11 +142,15 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
     ファイル形式:
         - pEqn_{time}_rank{rank}.dat
         - x_{time}_rank{rank}.dat
-        - A_csr_{time}.dat  (rankなし)
+        - A_csr_{time}.dat または A_csr_{time}_rank{rank}.dat
     """
     p_path   = os.path.join(gnn_dir, f"pEqn_{time_str}_rank{rank_str}.dat")
     x_path   = os.path.join(gnn_dir, f"x_{time_str}_rank{rank_str}.dat")
+
+    # CSR ファイルは両形式に対応
     csr_path = os.path.join(gnn_dir, f"A_csr_{time_str}.dat")
+    if not os.path.exists(csr_path):
+        csr_path = os.path.join(gnn_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
 
     if not os.path.exists(p_path):
         raise FileNotFoundError(p_path)
