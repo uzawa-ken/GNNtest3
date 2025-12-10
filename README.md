@@ -37,16 +37,23 @@ pip install matplotlib
 GNNtest3/
 ├── README.md                          # このファイル
 ├── GNN_train_val_weight.py            # メインスクリプト
-└── data/                              # データディレクトリ（要作成）
-    ├── pEqn_{time}_rank0.dat          # rank 0 の PDE 方程式情報
-    ├── pEqn_{time}_rank1.dat          # rank 1 の PDE 方程式情報
-    ├── ...                            # 他の rank のファイル
-    ├── x_{time}_rank0.dat             # rank 0 の OpenFOAM 解
-    ├── x_{time}_rank1.dat             # rank 1 の OpenFOAM 解
-    ├── ...
-    ├── A_csr_{time}_rank0.dat         # rank 0 の係数行列（CSR 形式）
-    ├── A_csr_{time}_rank1.dat         # rank 1 の係数行列（CSR 形式）
-    └── ...
+└── data/                              # データディレクトリ
+    ├── processor2/
+    │   └── gnn/
+    │       ├── A_csr_{time}.dat       # 係数行列（CSR 形式）
+    │       ├── pEqn_{time}_rank2.dat  # PDE 方程式情報
+    │       └── x_{time}_rank2.dat     # OpenFOAM の解
+    ├── processor4/
+    │   └── gnn/
+    │       ├── A_csr_{time}.dat
+    │       ├── pEqn_{time}_rank4.dat
+    │       └── x_{time}_rank4.dat
+    ├── processor5/
+    │   └── gnn/
+    │       └── ...
+    └── processor7/
+        └── gnn/
+            └── ...
 ```
 
 ### 複数プロセス対応
@@ -54,7 +61,7 @@ GNNtest3/
 本プログラムは MPI 並列計算で領域分割された OpenFOAM の結果に対応しています：
 
 - 各 rank（プロセス）のデータは独立したグラフとして扱われます
-- 全ての rank のデータを自動検出し、統合して学習を行います
+- `data/processor*/gnn/` ディレクトリを自動探索し、全ての rank のデータを検出します
 - 各 rank は異なるセル数を持つことができます
 - (time, rank) ペアを単位として train/val 分割を行います
 
@@ -88,9 +95,9 @@ OpenFOAM で計算された圧力値（正解データ）です。
 ...
 ```
 
-### CSR 行列ファイル（`A_csr_{time}_rank{N}.dat`）
+### CSR 行列ファイル（`A_csr_{time}.dat`）
 
-PDE の係数行列を CSR（Compressed Sparse Row）形式で格納したファイルです。各 rank ごとに独立したファイルが必要です。
+PDE の係数行列を CSR（Compressed Sparse Row）形式で格納したファイルです。各 processor ディレクトリ内に配置します（rank 番号なし）。
 
 ```
 nRows {行数}
@@ -108,7 +115,7 @@ VALUES
 
 ### 1. データの準備
 
-OpenFOAM の解析結果から上記形式のデータファイルを生成し、`./data` ディレクトリに配置してください。全ての rank のファイルを同一ディレクトリに配置します。
+OpenFOAM の解析結果から上記形式のデータファイルを生成し、`./data/processor{N}/gnn/` ディレクトリに配置してください。
 
 ### 2. 設定の調整
 
@@ -140,6 +147,7 @@ python GNN_train_val_weight.py
 実行時に以下の情報がログ出力されます：
 - 検出された rank 一覧
 - 検出された time 一覧
+- 検出された gnn_dir 数
 - 使用する (time, rank) ペアの総数
 - train/val 分割の詳細
 
