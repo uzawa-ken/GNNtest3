@@ -78,46 +78,79 @@ def log_print(msg: str):
 # ------------------------------------------------------------
 
 import re
+import glob
 
 def find_time_rank_list(data_dir: str):
     """
-    DATA_DIR 内から全ての pEqn_{time}_rank{rank}.dat を走査し、
-    対応する x_{time}_rank{rank}.dat と A_csr_{time}_rank{rank}.dat が
-    存在する (time, rank) ペアのリストを返す。
+    DATA_DIR/processor*/gnn/ 内から全ての pEqn_{time}_rank{rank}.dat を走査し、
+    対応する x_{time}_rank{rank}.dat と A_csr_{time}.dat が
+    存在する (time, rank, gnn_dir) タプルのリストを返す。
+
+    ディレクトリ構造:
+        data/
+        ├── processor2/gnn/
+        │   ├── A_csr_{time}.dat
+        │   ├── pEqn_{time}_rank2.dat
+        │   └── x_{time}_rank2.dat
+        ├── processor4/gnn/
+        │   └── ...
+        └── ...
     """
-    time_rank_pairs = []
+    time_rank_tuples = []
     pattern = re.compile(r"^pEqn_(.+)_rank(\d+)\.dat$")
 
-    for fn in os.listdir(data_dir):
-        match = pattern.match(fn)
-        if not match:
+    # data/processor*/gnn/ を探索
+    gnn_dirs = glob.glob(os.path.join(data_dir, "processor*", "gnn"))
+
+    for gnn_dir in gnn_dirs:
+        if not os.path.isdir(gnn_dir):
             continue
 
-        time_str = match.group(1)
-        rank_str = match.group(2)
+        for fn in os.listdir(gnn_dir):
+            match = pattern.match(fn)
+            if not match:
+                continue
 
-        x_path   = os.path.join(data_dir, f"x_{time_str}_rank{rank_str}.dat")
-        csr_path = os.path.join(data_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
+            time_str = match.group(1)
+            rank_str = match.group(2)
 
-        if os.path.exists(x_path) and os.path.exists(csr_path):
-            time_rank_pairs.append((time_str, rank_str))
+            x_path   = os.path.join(gnn_dir, f"x_{time_str}_rank{rank_str}.dat")
+            # CSR ファイルは A_csr_{time}.dat または A_csr_{time}_rank{rank}.dat の両形式に対応
+            csr_path = os.path.join(gnn_dir, f"A_csr_{time_str}.dat")
+            csr_path_with_rank = os.path.join(gnn_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
+
+            if os.path.exists(x_path):
+                if os.path.exists(csr_path) or os.path.exists(csr_path_with_rank):
+                    time_rank_tuples.append((time_str, rank_str, gnn_dir))
 
     # time の数値順、次に rank の数値順でソート
-    time_rank_pairs = sorted(
-        set(time_rank_pairs),
+    time_rank_tuples = sorted(
+        set(time_rank_tuples),
         key=lambda tr: (float(tr[0]), int(tr[1]))
     )
-    return time_rank_pairs
+    return time_rank_tuples
 
 
 # ------------------------------------------------------------
 # pEqn + CSR + x_true 読み込み
 # ------------------------------------------------------------
 
-def load_case_with_csr(data_dir: str, time_str: str, rank_str: str):
-    p_path   = os.path.join(data_dir, f"pEqn_{time_str}_rank{rank_str}.dat")
-    x_path   = os.path.join(data_dir, f"x_{time_str}_rank{rank_str}.dat")
-    csr_path = os.path.join(data_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
+def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
+    """
+    指定された gnn_dir から (time, rank) に対応するデータを読み込む。
+
+    ファイル形式:
+        - pEqn_{time}_rank{rank}.dat
+        - x_{time}_rank{rank}.dat
+        - A_csr_{time}.dat または A_csr_{time}_rank{rank}.dat
+    """
+    p_path   = os.path.join(gnn_dir, f"pEqn_{time_str}_rank{rank_str}.dat")
+    x_path   = os.path.join(gnn_dir, f"x_{time_str}_rank{rank_str}.dat")
+
+    # CSR ファイルは両形式に対応
+    csr_path = os.path.join(gnn_dir, f"A_csr_{time_str}.dat")
+    if not os.path.exists(csr_path):
+        csr_path = os.path.join(gnn_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
 
     if not os.path.exists(p_path):
         raise FileNotFoundError(p_path)
@@ -287,6 +320,7 @@ def load_case_with_csr(data_dir: str, time_str: str, rank_str: str):
     return {
         "time": time_str,
         "rank": rank_str,
+        "gnn_dir": gnn_dir,
         "feats_np": feats_np,
         "edge_index_np": edge_index_np,
         "x_true_np": x_true_np,
@@ -397,6 +431,7 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
     return {
         "time": rc["time"],
         "rank": rc["rank"],
+        "gnn_dir": rc["gnn_dir"],
         "feats": feats,
         "edge_index": edge_index,
         "x_true": x_true,
@@ -522,39 +557,41 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
     log_print(f"[INFO] Logging to {log_path}")
     log_print(f"[INFO] device = {device}")
 
-    # --- (time, rank) ペアリスト検出 & 分割 ---
-    all_time_rank_pairs = find_time_rank_list(data_dir)
-    if not all_time_rank_pairs:
+    # --- (time, rank, gnn_dir) タプルリスト検出 & 分割 ---
+    all_time_rank_tuples = find_time_rank_list(data_dir)
+    if not all_time_rank_tuples:
         raise RuntimeError(
-            f"{data_dir} 内に pEqn_*_rank*.dat / x_*_rank*.dat / A_csr_*_rank*.dat が見つかりませんでした。"
+            f"{data_dir}/processor*/gnn/ 内に pEqn_*_rank*.dat / x_*_rank*.dat / A_csr_*.dat が見つかりませんでした。"
         )
 
     # 検出されたランクの一覧をログ出力
-    all_ranks = sorted(set(r for _, r in all_time_rank_pairs), key=int)
-    all_times_unique = sorted(set(t for t, _ in all_time_rank_pairs), key=float)
+    all_ranks = sorted(set(r for _, r, _ in all_time_rank_tuples), key=int)
+    all_times_unique = sorted(set(t for t, _, _ in all_time_rank_tuples), key=float)
+    all_gnn_dirs = sorted(set(g for _, _, g in all_time_rank_tuples))
     log_print(f"[INFO] 検出された rank 一覧: {all_ranks}")
     log_print(f"[INFO] 検出された time 一覧: {all_times_unique[:10]}{'...' if len(all_times_unique) > 10 else ''}")
+    log_print(f"[INFO] 検出された gnn_dir 数: {len(all_gnn_dirs)}")
 
     # 以降の print(...) はすべて log_print(...) に置き換え
     random.seed(RANDOM_SEED)
-    random.shuffle(all_time_rank_pairs)
+    random.shuffle(all_time_rank_tuples)
 
-    all_time_rank_pairs = all_time_rank_pairs[:MAX_NUM_CASES]
-    n_total = len(all_time_rank_pairs)
+    all_time_rank_tuples = all_time_rank_tuples[:MAX_NUM_CASES]
+    n_total = len(all_time_rank_tuples)
     n_train = max(1, int(n_total * TRAIN_FRACTION))
     n_val   = n_total - n_train
 
-    pairs_train = all_time_rank_pairs[:n_train]
-    pairs_val   = all_time_rank_pairs[n_train:]
+    tuples_train = all_time_rank_tuples[:n_train]
+    tuples_val   = all_time_rank_tuples[n_train:]
 
     log_print(f"[INFO] 検出された (time, rank) ペア数 (使用分) = {n_total}")
     log_print(f"[INFO] train: {n_train} cases, val: {n_val} cases (TRAIN_FRACTION={TRAIN_FRACTION})")
     log_print("=== 使用する train ケース (time, rank) ===")
-    for t, r in pairs_train:
+    for t, r, g in tuples_train:
         log_print(f"  time={t}, rank={r}")
     log_print("=== 使用する val ケース (time, rank) ===")
-    if pairs_val:
-        for t, r in pairs_val:
+    if tuples_val:
+        for t, r, g in tuples_val:
             log_print(f"  time={t}, rank={r}")
     else:
         log_print("  (val ケースなし)")
@@ -565,11 +602,11 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
     raw_cases_train = []
     raw_cases_val   = []
 
-    train_set = set(pairs_train)
-    for t, r in all_time_rank_pairs:
+    train_set = set(tuples_train)
+    for t, r, g in all_time_rank_tuples:
         log_print(f"[LOAD] time={t}, rank={r} のグラフ+PDE情報を読み込み中...")
-        rc = load_case_with_csr(data_dir, t, r)
-        if (t, r) in train_set:
+        rc = load_case_with_csr(g, t, r)
+        if (t, r, g) in train_set:
             raw_cases_train.append(rc)
         else:
             raw_cases_val.append(rc)
