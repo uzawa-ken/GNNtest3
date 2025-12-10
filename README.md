@@ -132,6 +132,8 @@ LR             = 1e-3          # 学習率
 WEIGHT_DECAY   = 1e-5          # L2 正則化
 MAX_NUM_CASES  = 100           # 使用する (time, rank) ペア数の上限
 TRAIN_FRACTION = 0.8           # 訓練データの割合
+HIDDEN_CHANNELS = 64           # 中間層のチャネル数
+NUM_LAYERS      = 4            # GraphSAGE の層数
 
 # 損失関数の重み
 LAMBDA_DATA = 0.1              # データ損失の重み
@@ -151,9 +153,36 @@ python GNN_train_val_weight.py
 - 使用する (time, rank) ペアの総数
 - train/val 分割の詳細
 
+### 4. ハイパーパラメータの自動探索（Optuna）
+
+最終検証誤差（相対誤差）を最小化するように、学習率や損失の重みを自動探索するサンプルスクリプトを用意しています。
+
+1. Optuna をインストール
+
+    ```bash
+    pip install optuna
+    ```
+
+2. 探索を実行
+
+    ```bash
+    python hyperparameter_search_optuna.py --trials 20 --data_dir ./data --num_epochs 200 \
+        --train_fraction 0.8 --random_seed 42
+    ```
+
+    - `--trials`: 試行回数（多いほど精度向上が見込まれますが計算時間が増加します）
+    - `--num_epochs`: 1 試行あたりのエポック数（短めに設定すると探索が高速化します）
+    - `--max_num_cases`: 1 試行で使用する (time, rank) ペアの最大数（デフォルト 30）
+    - `--train_fraction`: train/val 分割の割合（デフォルト 0.8）
+    - `--random_seed`: Optuna のサンプラーと学習の乱数シード（デフォルト 42）
+    - `--log_file`: 試行番号と検証誤差（タブ区切り）を試行ごとに追記するログファイル（デフォルト `optuna_trials_history.tsv`）
+    - （自動探索対象）`lr`, `weight_decay`, `lambda_data`, `lambda_pde`, `hidden_channels`, `num_layers`
+
+3. 実行後、最小の検証誤差と最適パラメータがコンソールに表示されます。また、ログファイルには各試行の番号と検証誤差が時系列で追記されます。
+
 ## モデルアーキテクチャ
 
-GraphSAGE ベースの 4 層ニューラルネットワークを使用しています。
+GraphSAGE ベースの多層ニューラルネットワークを使用しています（デフォルトは 64 チャネル・4 層、Optuna から `hidden_channels` と `num_layers` を調整可能）。
 
 | 層 | 入力次元 | 出力次元 | 活性化関数 |
 |---|---------|---------|----------|

@@ -47,6 +47,8 @@ LR             = 1e-3
 WEIGHT_DECAY   = 1e-5
 MAX_NUM_CASES  = 100   # 自動検出した time のうち先頭 MAX_NUM_CASES 件を使用
 TRAIN_FRACTION = 0.8   # 全ケースのうち train に使う割合
+HIDDEN_CHANNELS = 64
+NUM_LAYERS      = 4
 
 LAMBDA_DATA = 0.1
 LAMBDA_PDE  = 0.0001
@@ -527,7 +529,12 @@ def update_plot(fig, axes, history):
 # メイン: train/val 分離版
 # ------------------------------------------------------------
 
-def train_gnn_auto_trainval_pde_weighted(data_dir: str):
+def train_gnn_auto_trainval_pde_weighted(
+    data_dir: str,
+    *,
+    enable_plot: bool = True,
+    return_history: bool = False,
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     global LOGGER_FILE
@@ -682,13 +689,19 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
     num_val   = len(cases_val)
 
     # --- モデル定義 ---
-    model = SimpleSAGE(in_channels=nFeat, hidden_channels=64, num_layers=4).to(device)
+    model = SimpleSAGE(
+        in_channels=nFeat,
+        hidden_channels=HIDDEN_CHANNELS,
+        num_layers=NUM_LAYERS,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     log_print("=== Training start (relative data loss + weighted PDE loss, train/val split) ===")
 
     # --- 可視化用の準備 ---
-    fig, axes = init_plot()
+    fig, axes = (None, None)
+    if enable_plot:
+        fig, axes = init_plot()
     history = {
         "epoch": [],
         "loss": [],
@@ -823,7 +836,8 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
             history["rel_err_val"].append(avg_rel_err_val)  # None の可能性あり
 
             # プロット更新
-            update_plot(fig, axes, history)
+            if enable_plot:
+                update_plot(fig, axes, history)
 
             # コンソールログ
             log = (
@@ -849,7 +863,7 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
 
     # --- 最終プロットの保存 ---
     # すべての history を使って最終状態の図を更新・保存
-    if len(history["epoch"]) > 0:
+    if enable_plot and len(history["epoch"]) > 0:
         final_plot_filename = (
             f"training_history_"
             f"DATA{lambda_data_tag}_"
@@ -1054,6 +1068,9 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
                 for i, val in enumerate(x_pred_np):
                     f.write(f"{i} {val:.9e}\n")
             log_print(f"    [INFO] val x_pred を {out_path} に書き出しました。")
+
+    if return_history:
+        return history
 
 if __name__ == "__main__":
     train_gnn_auto_trainval_pde_weighted(DATA_DIR)
