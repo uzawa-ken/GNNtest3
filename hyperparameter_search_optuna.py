@@ -1,0 +1,167 @@
+"""簡易的な Optuna によるハイパーパラメータ探索スクリプト。
+
+最終検証誤差（相対誤差）の最小値を目的関数とし、
+`GNN_train_val_weight.py` のハイパーパラメータを自動調整します。
+
+主な特徴:
+- 学習率、Weight Decay、損失の重み（LAMBDA_DATA / LAMBDA_PDE）を探索
+- 学習曲線の描画は無効化して高速化
+- 返却される検証誤差の最小値を Optuna が最小化
+- 乱数シードと train/val 分割比率を引数で指定して再現性を確保
+
+実行例:
+    python hyperparameter_search_optuna.py --trials 20 --data_dir ./data
+
+注意:
+- Optuna がインストールされていない場合は `pip install optuna` を実行してください。
+- 本スクリプトは 1 試行につき `GNN_train_val_weight.py` と同じ学習を行うため、
+  試行回数を増やすと計算コストが増えます。少ない試行から始めてください。
+"""
+
+from __future__ import annotations
+
+import argparse
+import random
+from typing import List
+
+import numpy as np
+
+try:
+    import optuna
+except ImportError as exc:  # pragma: no cover - ユーザー環境でのみ発生しうるため
+    raise RuntimeError(
+        "Optuna が見つかりません。`pip install optuna` を実行してください。"
+    ) from exc
+
+import GNN_train_val_weight as gnn
+
+
+def _set_global_params(
+    *,
+    lr: float,
+    weight_decay: float,
+    lambda_data: float,
+    lambda_pde: float,
+    num_epochs: int,
+    train_fraction: float,
+    max_num_cases: int,
+    random_seed: int,
+) -> None:
+    """GNN トレーニングスクリプトのグローバル設定を上書きするヘルパー。"""
+
+    gnn.LR = lr
+    gnn.WEIGHT_DECAY = weight_decay
+    gnn.LAMBDA_DATA = lambda_data
+    gnn.LAMBDA_PDE = lambda_pde
+    gnn.NUM_EPOCHS = num_epochs
+    gnn.TRAIN_FRACTION = train_fraction
+    gnn.MAX_NUM_CASES = max_num_cases
+    gnn.RANDOM_SEED = random_seed
+
+
+def _extract_best_val_error(history: dict) -> float:
+    """学習履歴から最良の検証相対誤差を取り出す。"""
+
+    val_errors: List[float] = [v for v in history["rel_err_val"] if v is not None]
+    if val_errors:
+        return float(np.min(val_errors))
+
+    # 検証データが無い場合は訓練誤差を代用
+    if history["rel_err_train"]:
+        return float(history["rel_err_train"][-1])
+
+    raise RuntimeError("学習履歴が空のため評価指標を取得できませんでした。")
+
+
+def objective(
+    trial: optuna.Trial,
+    data_dir: str,
+    num_epochs: int,
+    max_num_cases: int,
+    train_fraction: float,
+    random_seed: int,
+) -> float:
+    """Optuna 用の目的関数。"""
+
+    # サンプルするハイパーパラメータ
+    lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    lambda_data = trial.suggest_float("lambda_data", 1e-3, 1.0, log=True)
+    lambda_pde = trial.suggest_float("lambda_pde", 1e-5, 1e-1, log=True)
+
+    _set_global_params(
+        lr=lr,
+        weight_decay=weight_decay,
+        lambda_data=lambda_data,
+        lambda_pde=lambda_pde,
+        num_epochs=num_epochs,
+        train_fraction=train_fraction,
+        max_num_cases=max_num_cases,
+        random_seed=random_seed,
+    )
+
+    # 乱数シードをそろえて再現性を確保
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+
+    # 学習を実行（プロットなし）
+    history = gnn.train_gnn_auto_trainval_pde_weighted(
+        data_dir,
+        enable_plot=False,
+        return_history=True,
+    )
+
+    # 目的関数として最小検証相対誤差を返す
+    return _extract_best_val_error(history)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Optuna によるハイパーパラメータ探索")
+    parser.add_argument("--data_dir", default=gnn.DATA_DIR, help="学習データのディレクトリ")
+    parser.add_argument("--trials", type=int, default=10, help="試行回数")
+    parser.add_argument("--num_epochs", type=int, default=200, help="1 試行あたりのエポック数")
+    parser.add_argument(
+        "--max_num_cases",
+        type=int,
+        default=30,
+        help="探索時に使用する (time, rank) ペアの最大件数",
+    )
+    parser.add_argument(
+        "--train_fraction",
+        type=float,
+        default=0.8,
+        help="探索時の train/val 分割比率",
+    )
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=42,
+        help="乱数シード（Optuna と学習の再現性用）",
+    )
+
+    args = parser.parse_args()
+
+    sampler = optuna.samplers.TPESampler(seed=args.random_seed)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study.optimize(
+        lambda trial: objective(
+            trial,
+            args.data_dir,
+            args.num_epochs,
+            args.max_num_cases,
+            args.train_fraction,
+            args.random_seed,
+        ),
+        n_trials=args.trials,
+        show_progress_bar=True,
+    )
+
+    print("=== Best trial ===")
+    print(f"  value (min val rel err): {study.best_trial.value:.4e}")
+    print("  params:")
+    for k, v in study.best_trial.params.items():
+        print(f"    {k}: {v}")
+
+
+if __name__ == "__main__":
+    main()

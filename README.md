@@ -151,6 +151,31 @@ python GNN_train_val_weight.py
 - 使用する (time, rank) ペアの総数
 - train/val 分割の詳細
 
+### 4. ハイパーパラメータの自動探索（Optuna）
+
+最終検証誤差（相対誤差）を最小化するように、学習率や損失の重みを自動探索するサンプルスクリプトを用意しています。
+
+1. Optuna をインストール
+
+    ```bash
+    pip install optuna
+    ```
+
+2. 探索を実行
+
+    ```bash
+    python hyperparameter_search_optuna.py --trials 20 --data_dir ./data --num_epochs 200 \
+        --train_fraction 0.8 --random_seed 42
+    ```
+
+    - `--trials`: 試行回数（多いほど精度向上が見込まれますが計算時間が増加します）
+    - `--num_epochs`: 1 試行あたりのエポック数（短めに設定すると探索が高速化します）
+    - `--max_num_cases`: 1 試行で使用する (time, rank) ペアの最大数（デフォルト 30）
+    - `--train_fraction`: train/val 分割の割合（デフォルト 0.8）
+    - `--random_seed`: Optuna のサンプラーと学習の乱数シード（デフォルト 42）
+
+3. 実行後、最小の検証誤差と最適パラメータがコンソールに表示されます。
+
 ## モデルアーキテクチャ
 
 GraphSAGE ベースの 4 層ニューラルネットワークを使用しています。
