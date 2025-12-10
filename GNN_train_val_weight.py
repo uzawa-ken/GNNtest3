@@ -42,8 +42,6 @@ except ImportError:
 
 DATA_DIR       = "./data"
 OUTPUT_DIR     = "./"
-
-# RANK_STR は削除（全ての rank を自動検出）
 NUM_EPOCHS     = 1000
 LR             = 1e-3
 WEIGHT_DECAY   = 1e-5
@@ -110,6 +108,7 @@ def find_time_rank_list(data_dir: str):
         key=lambda tr: (float(tr[0]), int(tr[1]))
     )
     return time_rank_pairs
+
 
 # ------------------------------------------------------------
 # pEqn + CSR + x_true 読み込み
@@ -417,24 +416,27 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
 
 EPS_PLOT = 1e-12  # まだ無ければ定数として追加
 
+EPS_PLOT = 1e-12  # ログプロット用の下限値
+
 def init_plot():
     plt.ion()
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # 横に 2 つのサブプロット（左：損失, 右：相対誤差）
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
 
     # タイトルに係数を表示
     fig.suptitle(
-#        f"Training Progress "
         f"データ損失係数: {LAMBDA_DATA:g}, PDE損失係数: {LAMBDA_PDE:g}",
         fontsize=12
     )
 
-    # ここでは subplots_adjust は一旦使わない（tight_layout で調整）
-    return fig, ax
+    # レイアウトは update_plot 側で tight_layout をかける
+    return fig, axes
 
+def update_plot(fig, axes, history):
+    ax_loss, ax_rel = axes  # 左：損失, 右：相対誤差
 
-
-def update_plot(fig, ax, history):
-    ax.clear()
+    ax_loss.clear()
+    ax_rel.clear()
 
     epochs = np.array(history["epoch"], dtype=np.int32)
     if len(epochs) == 0:
@@ -450,10 +452,7 @@ def update_plot(fig, ax, history):
         dtype=np.float64
     )
 
-    # ★ 追加: 圧力真値・予測値の RMS（訓練データ平均）
-    x_true_rms = np.array(history["x_true_rms"], dtype=np.float64)
-    x_pred_rms = np.array(history["x_pred_rms"], dtype=np.float64)
-
+    # 下限を切ってログスケールに耐えられるようにする
     loss_safe      = np.clip(loss,      EPS_PLOT, None)
     data_loss_safe = np.clip(data_loss, EPS_PLOT, None)
     pde_loss_safe  = np.clip(pde_loss,  EPS_PLOT, None)
@@ -463,38 +462,31 @@ def update_plot(fig, ax, history):
     mask = np.isfinite(rel_val_safe)
     rel_val_safe[mask] = np.clip(rel_val_safe[mask], EPS_PLOT, None)
 
-    # ★ RMS もログスケールで表示できるように下限をクリップ
-    x_true_rms_safe = np.clip(x_true_rms, EPS_PLOT, None)
-    x_pred_rms_safe = np.clip(x_pred_rms, EPS_PLOT, None)
+    # --- 左グラフ：損失系（総損失・データ損失・PDE損失） ---
+    ax_loss.plot(epochs, loss_safe,      label="総損失",      linewidth=2)
+    ax_loss.plot(epochs, data_loss_safe, label="データ損失",  linewidth=1.5, linestyle="--")
+    ax_loss.plot(epochs, pde_loss_safe,  label="PDE損失",    linewidth=1.5, linestyle="--")
 
-    # --- プロット ---
-    ax.plot(epochs, loss_safe,      label="総損失",                   linewidth=2)
-    ax.plot(epochs, data_loss_safe, label="データ損失",              linewidth=1.5, linestyle="--")
-    ax.plot(epochs, pde_loss_safe,  label="PDE 損失",               linewidth=1.5, linestyle="--")
-    ax.plot(epochs, rel_tr_safe,    label="相対誤差（訓練データ）",    linewidth=1.5)
-    ax.plot(epochs, rel_val_safe,   label="相対誤差（テストデータ）",  linewidth=1.5)
+    ax_loss.set_xlabel("エポック数")
+    ax_loss.set_ylabel("損失")
+    ax_loss.set_yscale("log")
+    ax_loss.grid(True, alpha=0.3)
+    ax_loss.legend()
 
-    # ★ 追加: 圧力の真値・予測の RMS（訓練データ平均）
-    ax.plot(epochs, x_true_rms_safe, label="圧力真値 RMS（訓練）",  linewidth=1.0, linestyle=":")
-    ax.plot(epochs, x_pred_rms_safe, label="圧力予測 RMS（訓練）",  linewidth=1.0, linestyle=":")
+    # --- 右グラフ：相対誤差（train/val） ---
+    ax_rel.plot(epochs, rel_tr_safe,  label="相対誤差（訓練データ）", linewidth=1.5)
+    ax_rel.plot(epochs, rel_val_safe, label="相対誤差（テストデータ）", linewidth=1.5)
 
-    ax.set_xlabel("エポック数")
-    ax.set_ylabel("損失 / 相対誤差 / 圧力RMS")
-    ax.set_yscale("log")
-    ax.grid(True, alpha=0.3)
+    ax_rel.set_xlabel("エポック数")
+    ax_rel.set_ylabel("相対誤差")
+    ax_rel.set_yscale("log")
+    ax_rel.grid(True, alpha=0.3)
+    ax_rel.legend()
 
-    ax.legend(
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        borderaxespad=0.0,
-    )
-
-    fig.tight_layout(rect=[0.05, 0.05, 0.95, 0.95])
+    # 図全体のレイアウト調整
+    fig.tight_layout(rect=[0.05, 0.05, 0.95, 0.90])
 
     plt.pause(0.01)
-
-
-
 
 # ------------------------------------------------------------
 # メイン: train/val 分離版
@@ -659,7 +651,7 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
     log_print("=== Training start (relative data loss + weighted PDE loss, train/val split) ===")
 
     # --- 可視化用の準備 ---
-    fig, ax = init_plot()
+    fig, axes = init_plot()
     history = {
         "epoch": [],
         "loss": [],
@@ -667,11 +659,7 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
         "pde_loss": [],
         "rel_err_train": [],
         "rel_err_val": [],  # val が無いときは None
-        # ★ 追加: 圧力の真値・予測値の RMS（訓練データ平均）
-        "x_true_rms": [],
-        "x_pred_rms": [],
     }
-
 
     # --- 学習ループ ---
     for epoch in range(1, NUM_EPOCHS + 1):
@@ -683,10 +671,6 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
         sum_rel_err_tr  = 0.0
         sum_R_pred_tr   = 0.0
         sum_rmse_tr     = 0.0
-
-        # ★ 追加: 真値・予測の RMS の合計（後で平均をとる）
-        sum_x_true_rms_tr = 0.0
-        sum_x_pred_rms_tr = 0.0
 
         # -------- train で勾配計算 --------
         for cs in cases_train:
@@ -733,20 +717,9 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
                 sum_R_pred_tr  += R_pred.detach().item()
                 sum_rmse_tr    += rmse_case.item()
 
-                # ★ 追加: x_true, x_pred の RMS を計算して加算
-                rms_x_true = torch.sqrt(torch.sum(x_true * x_true) / N)
-                rms_x_pred = torch.sqrt(torch.sum(x_pred * x_pred) / N)
-                sum_x_true_rms_tr += rms_x_true.item()
-                sum_x_pred_rms_tr += rms_x_pred.item()
-
-
         total_data_loss = total_data_loss / num_train
         total_pde_loss  = total_pde_loss  / num_train
         loss = LAMBDA_DATA * total_data_loss + LAMBDA_PDE * total_pde_loss
-
-        # ★ 追加: 訓練データに対する RMS の平均
-        avg_x_true_rms_tr = sum_x_true_rms_tr / num_train
-        avg_x_pred_rms_tr = sum_x_pred_rms_tr / num_train
 
         loss.backward()
         optimizer.step()
@@ -812,13 +785,8 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
             history["rel_err_train"].append(avg_rel_err_tr)
             history["rel_err_val"].append(avg_rel_err_val)  # None の可能性あり
 
-            # ★ 追加: 圧力真値/予測値の RMS（訓練平均）
-            history["x_true_rms"].append(avg_x_true_rms_tr)
-            history["x_pred_rms"].append(avg_x_pred_rms_tr)
-
-
             # プロット更新
-            update_plot(fig, ax, history)
+            update_plot(fig, axes, history)
 
             # コンソールログ
             log = (
@@ -845,22 +813,16 @@ def train_gnn_auto_trainval_pde_weighted(data_dir: str):
     # --- 最終プロットの保存 ---
     # すべての history を使って最終状態の図を更新・保存
     if len(history["epoch"]) > 0:
-#        lambda_data_tag = str(LAMBDA_DATA).replace('.', 'p')
-#        lambda_pde_tag  = str(LAMBDA_PDE).replace('.', 'p')
         final_plot_filename = (
             f"training_history_"
-#            f"LD{lambda_data_tag}_"
             f"DATA{lambda_data_tag}_"
-#            f"LP{lambda_pde_tag}_"
             f"PDE{lambda_pde_tag}.png"
-#            f"{timestamp}.png"
         )
         final_plot_path = os.path.join(OUTPUT_DIR, final_plot_filename)
 
-        update_plot(fig, ax, history)
+        update_plot(fig, axes, history)
         fig.savefig(final_plot_path, dpi=200, bbox_inches='tight')
         log_print(f"[INFO] Training history figure saved to {final_plot_path}")
-
 
     # --- 実行時間の計測結果をログ出力 ---
     elapsed = time.time() - start_time
