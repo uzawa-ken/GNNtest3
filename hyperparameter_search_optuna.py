@@ -108,10 +108,10 @@ def objective(
     """Optuna 用の目的関数。"""
 
     # サンプルするハイパーパラメータ
-    lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
-    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-    lambda_data = trial.suggest_float("lambda_data", 1e-3, 1.0, log=True)
-    lambda_pde = trial.suggest_float("lambda_pde", 1e-5, 1e-1, log=True)
+    lr = trial.suggest_float(name="lr", low=1e-4, high=1e-2, log=True)
+    weight_decay = trial.suggest_float(name="weight_decay", low=1e-6, high=1e-3, log=True)
+    lambda_data = trial.suggest_float(name="lambda_data", low=1e-3, high=1.0, log=True)
+    lambda_pde = trial.suggest_float(name="lambda_pde", low=1e-5, high=1e-1, log=True)
     hidden_channels = trial.suggest_int("hidden_channels", 32, 256, log=True)
     num_layers = trial.suggest_int("num_layers", 3, 6)
 
