@@ -132,6 +132,8 @@ LR             = 1e-3          # 学習率
 WEIGHT_DECAY   = 1e-5          # L2 正則化
 MAX_NUM_CASES  = 100           # 使用する (time, rank) ペア数の上限
 TRAIN_FRACTION = 0.8           # 訓練データの割合
+HIDDEN_CHANNELS = 64           # 中間層のチャネル数
+NUM_LAYERS      = 4            # GraphSAGE の層数
 
 # 損失関数の重み
 LAMBDA_DATA = 0.1              # データ損失の重み
@@ -173,12 +175,13 @@ python GNN_train_val_weight.py
     - `--max_num_cases`: 1 試行で使用する (time, rank) ペアの最大数（デフォルト 30）
     - `--train_fraction`: train/val 分割の割合（デフォルト 0.8）
     - `--random_seed`: Optuna のサンプラーと学習の乱数シード（デフォルト 42）
+    - （自動探索対象）`lr`, `weight_decay`, `lambda_data`, `lambda_pde`, `hidden_channels`, `num_layers`
 
 3. 実行後、最小の検証誤差と最適パラメータがコンソールに表示されます。
 
 ## モデルアーキテクチャ
 
-GraphSAGE ベースの 4 層ニューラルネットワークを使用しています。
+GraphSAGE ベースの多層ニューラルネットワークを使用しています（デフォルトは 64 チャネル・4 層、Optuna から `hidden_channels` と `num_layers` を調整可能）。
 
 | 層 | 入力次元 | 出力次元 | 活性化関数 |
 |---|---------|---------|----------|

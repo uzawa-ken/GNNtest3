@@ -47,6 +47,8 @@ LR             = 1e-3
 WEIGHT_DECAY   = 1e-5
 MAX_NUM_CASES  = 100   # 自動検出した time のうち先頭 MAX_NUM_CASES 件を使用
 TRAIN_FRACTION = 0.8   # 全ケースのうち train に使う割合
+HIDDEN_CHANNELS = 64
+NUM_LAYERS      = 4
 
 LAMBDA_DATA = 0.1
 LAMBDA_PDE  = 0.0001
@@ -687,7 +689,11 @@ def train_gnn_auto_trainval_pde_weighted(
     num_val   = len(cases_val)
 
     # --- モデル定義 ---
-    model = SimpleSAGE(in_channels=nFeat, hidden_channels=64, num_layers=4).to(device)
+    model = SimpleSAGE(
+        in_channels=nFeat,
+        hidden_channels=HIDDEN_CHANNELS,
+        num_layers=NUM_LAYERS,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     log_print("=== Training start (relative data loss + weighted PDE loss, train/val split) ===")

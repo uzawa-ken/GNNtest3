@@ -4,7 +4,7 @@
 `GNN_train_val_weight.py` のハイパーパラメータを自動調整します。
 
 主な特徴:
-- 学習率、Weight Decay、損失の重み（LAMBDA_DATA / LAMBDA_PDE）を探索
+- 学習率、Weight Decay、損失の重み（LAMBDA_DATA / LAMBDA_PDE）、GNN の隠れチャネル数 / 層数を探索
 - 学習曲線の描画は無効化して高速化
 - 返却される検証誤差の最小値を Optuna が最小化
 - 乱数シードと train/val 分割比率を引数で指定して再現性を確保
@@ -42,6 +42,8 @@ def _set_global_params(
     weight_decay: float,
     lambda_data: float,
     lambda_pde: float,
+    hidden_channels: int,
+    num_layers: int,
     num_epochs: int,
     train_fraction: float,
     max_num_cases: int,
@@ -53,6 +55,8 @@ def _set_global_params(
     gnn.WEIGHT_DECAY = weight_decay
     gnn.LAMBDA_DATA = lambda_data
     gnn.LAMBDA_PDE = lambda_pde
+    gnn.HIDDEN_CHANNELS = hidden_channels
+    gnn.NUM_LAYERS = num_layers
     gnn.NUM_EPOCHS = num_epochs
     gnn.TRAIN_FRACTION = train_fraction
     gnn.MAX_NUM_CASES = max_num_cases
@@ -88,12 +92,16 @@ def objective(
     weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
     lambda_data = trial.suggest_float("lambda_data", 1e-3, 1.0, log=True)
     lambda_pde = trial.suggest_float("lambda_pde", 1e-5, 1e-1, log=True)
+    hidden_channels = trial.suggest_int("hidden_channels", 32, 256, log=True)
+    num_layers = trial.suggest_int("num_layers", 3, 6)
 
     _set_global_params(
         lr=lr,
         weight_decay=weight_decay,
         lambda_data=lambda_data,
         lambda_pde=lambda_pde,
+        hidden_channels=hidden_channels,
+        num_layers=num_layers,
         num_epochs=num_epochs,
         train_fraction=train_fraction,
         max_num_cases=max_num_cases,
