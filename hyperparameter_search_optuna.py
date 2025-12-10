@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import random
+from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -63,6 +64,24 @@ def _set_global_params(
     gnn.RANDOM_SEED = random_seed
 
 
+def _append_trial_result(log_file: Path, trial_number: int, val_error: float) -> None:
+    """試行結果をテキストファイルへ逐次追記する。
+
+    形式: 1 列目に試行番号、2 列目に検証誤差（相対誤差）。
+    ファイルが存在しない場合はヘッダー行を付与する。
+    """
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    header = "# trial\tval_error\n"
+    line = f"{trial_number}\t{val_error:.6e}\n"
+
+    if not log_file.exists():
+        log_file.write_text(header + line, encoding="utf-8")
+    else:
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(line)
+
+
 def _extract_best_val_error(history: dict) -> float:
     """学習履歴から最良の検証相対誤差を取り出す。"""
 
@@ -84,6 +103,7 @@ def objective(
     max_num_cases: int,
     train_fraction: float,
     random_seed: int,
+    log_file: Path,
 ) -> float:
     """Optuna 用の目的関数。"""
 
@@ -120,7 +140,9 @@ def objective(
     )
 
     # 目的関数として最小検証相対誤差を返す
-    return _extract_best_val_error(history)
+    val_error = _extract_best_val_error(history)
+    _append_trial_result(log_file, trial.number, val_error)
+    return val_error
 
 
 def main() -> None:
@@ -146,6 +168,12 @@ def main() -> None:
         default=42,
         help="乱数シード（Optuna と学習の再現性用）",
     )
+    parser.add_argument(
+        "--log_file",
+        type=Path,
+        default=Path("optuna_trials_history.tsv"),
+        help="試行番号と検証誤差を逐次追記するログファイルのパス",
+    )
 
     args = parser.parse_args()
 
@@ -159,6 +187,7 @@ def main() -> None:
             args.max_num_cases,
             args.train_fraction,
             args.random_seed,
+            args.log_file,
         ),
         n_trials=args.trials,
         show_progress_bar=True,

@@ -175,9 +175,10 @@ python GNN_train_val_weight.py
     - `--max_num_cases`: 1 試行で使用する (time, rank) ペアの最大数（デフォルト 30）
     - `--train_fraction`: train/val 分割の割合（デフォルト 0.8）
     - `--random_seed`: Optuna のサンプラーと学習の乱数シード（デフォルト 42）
+    - `--log_file`: 試行番号と検証誤差（タブ区切り）を試行ごとに追記するログファイル（デフォルト `optuna_trials_history.tsv`）
     - （自動探索対象）`lr`, `weight_decay`, `lambda_data`, `lambda_pde`, `hidden_channels`, `num_layers`
 
-3. 実行後、最小の検証誤差と最適パラメータがコンソールに表示されます。
+3. 実行後、最小の検証誤差と最適パラメータがコンソールに表示されます。また、ログファイルには各試行の番号と検証誤差が時系列で追記されます。
 
 ## モデルアーキテクチャ
 
