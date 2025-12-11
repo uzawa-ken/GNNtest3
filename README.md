@@ -135,6 +135,12 @@ TRAIN_FRACTION = 0.8           # 訓練データの割合
 HIDDEN_CHANNELS = 64           # 中間層のチャネル数
 NUM_LAYERS      = 4            # GraphSAGE の層数
 
+# 学習率スケジューラ（ReduceLROnPlateau）
+USE_LR_SCHEDULER = True        # 検証誤差が停滞したら学習率を下げる
+LR_SCHED_FACTOR = 0.5          # 学習率を何倍に下げるか
+LR_SCHED_PATIENCE = 20         # 何エポック改善が無ければ下げるか
+LR_SCHED_MIN_LR = 1e-6         # 学習率の下限
+
 # 損失関数の重み
 LAMBDA_DATA = 0.1              # データ損失の重み
 LAMBDA_PDE  = 0.0001           # PDE 損失の重み
@@ -179,6 +185,14 @@ python GNN_train_val_weight.py
     - （自動探索対象）`lr`, `weight_decay`, `lambda_data`, `lambda_pde`, `hidden_channels`, `num_layers`
 
 3. 実行後、最小の検証誤差と最適パラメータがコンソールに表示されます。また、ログファイルには各試行の番号と検証誤差が時系列で追記されます。
+
+## 検証誤差が頭打ちになるときのチェックリスト
+
+- **学習率スケジューラを有効化**: デフォルトで `ReduceLROnPlateau` を使い、検証誤差が一定期間改善しないときに学習率を自動で 0.5 倍に下げます（最小学習率 `1e-6`）。`USE_LR_SCHEDULER` を `True` のままにしてください。
+- **エポック数を増やす**: 収束に時間がかかる場合は `NUM_EPOCHS` や Optuna の `--num_epochs` を伸ばすと改善することがあります。
+- **train/val 分割を見直す**: `TRAIN_FRACTION` を 0.8 以上にして学習データを増やすか、`max_num_cases` を増やしてサンプル多様性を上げてください。
+- **損失重みのバランス**: `lambda_pde` が大きすぎるとデータ適合が弱くなる場合があります。`lambda_data` と併せて探索範囲を広げるか、`hyperparameter_search_optuna.py` で試行回数を増やしてください。
+- **隠れチャネル / 層数**: `hidden_channels` と `num_layers` を広めに探索すると表現力不足を避けられます。
 
 ## モデルアーキテクチャ
 

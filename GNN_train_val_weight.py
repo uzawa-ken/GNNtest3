@@ -50,6 +50,12 @@ TRAIN_FRACTION = 0.8   # 全ケースのうち train に使う割合
 HIDDEN_CHANNELS = 64
 NUM_LAYERS      = 4
 
+# 学習率スケジューラ（ReduceLROnPlateau）用パラメータ
+USE_LR_SCHEDULER = True
+LR_SCHED_FACTOR = 0.5
+LR_SCHED_PATIENCE = 20
+LR_SCHED_MIN_LR = 1e-6
+
 LAMBDA_DATA = 0.1
 LAMBDA_PDE  = 0.0001
 
@@ -695,6 +701,16 @@ def train_gnn_auto_trainval_pde_weighted(
         num_layers=NUM_LAYERS,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = None
+    if USE_LR_SCHEDULER:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=LR_SCHED_FACTOR,
+            patience=LR_SCHED_PATIENCE,
+            min_lr=LR_SCHED_MIN_LR,
+            verbose=False,
+        )
 
     log_print("=== Training start (relative data loss + weighted PDE loss, train/val split) ===")
 
@@ -774,6 +790,59 @@ def train_gnn_auto_trainval_pde_weighted(
         loss.backward()
         optimizer.step()
 
+        avg_rel_err_val = None
+        avg_R_pred_val = None
+        avg_rmse_val = None
+
+        # スケジューラ用・ロギング用に検証誤差を計算（必要なときのみ）
+        need_val_eval = num_val > 0 and (scheduler is not None or epoch % PLOT_INTERVAL == 0)
+        if need_val_eval:
+            model.eval()
+            sum_rel_err_val = 0.0
+            sum_R_pred_val = 0.0
+            sum_rmse_val = 0.0
+            with torch.no_grad():
+                for cs in cases_val:
+                    feats = cs["feats"]
+                    edge_index = cs["edge_index"]
+                    x_true = cs["x_true"]
+                    b = cs["b"]
+                    row_ptr = cs["row_ptr"]
+                    col_ind = cs["col_ind"]
+                    vals = cs["vals"]
+                    row_idx = cs["row_idx"]
+                    w_pde = cs["w_pde"]
+
+                    x_pred_norm = model(feats, edge_index)
+                    x_pred = x_pred_norm * x_std_t + x_mean_t
+
+                    diff = x_pred - x_true
+                    rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
+                    N = x_true.shape[0]
+                    rmse = torch.sqrt(torch.sum(diff * diff) / N)
+
+                    Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+                    r = Ax - b
+                    sqrt_w = torch.sqrt(w_pde)
+                    wr = sqrt_w * r
+                    wb = sqrt_w * b
+                    norm_wr = torch.norm(wr)
+                    norm_wb = torch.norm(wb) + EPS_RES
+                    R_pred = norm_wr / norm_wb
+
+                    sum_rel_err_val += rel_err.item()
+                    sum_R_pred_val += R_pred.item()
+                    sum_rmse_val += rmse.item()
+
+            avg_rel_err_val = sum_rel_err_val / num_val
+            avg_R_pred_val = sum_R_pred_val / num_val
+            avg_rmse_val = sum_rmse_val / num_val
+
+        # 学習率スケジューラを更新（検証誤差があればそれを監視）
+        if scheduler is not None:
+            metric_for_scheduler = avg_rel_err_val if avg_rel_err_val is not None else loss.item()
+            scheduler.step(metric_for_scheduler)
+
 
         # --- ロギング（train + val） ---
         if epoch % PLOT_INTERVAL == 0 or epoch == 1:
@@ -781,11 +850,14 @@ def train_gnn_auto_trainval_pde_weighted(
             avg_R_pred_tr  = sum_R_pred_tr / num_train
             avg_rmse_tr    = sum_rmse_tr / num_train
 
+            current_lr = optimizer.param_groups[0]["lr"]
+
             avg_rel_err_val = None
             avg_R_pred_val  = None
             avg_rmse_val    = None
 
-            if num_val > 0:
+            if num_val > 0 and avg_rel_err_val is None:
+                # スケジューラを使っていない場合などで、まだ val を計算していないときのみ算出
                 model.eval()
                 sum_rel_err_val = 0.0
                 sum_R_pred_val  = 0.0
@@ -842,6 +914,7 @@ def train_gnn_auto_trainval_pde_weighted(
             # コンソールログ
             log = (
                 f"[Epoch {epoch:5d}] loss={loss.item():.4e}, "
+                f"lr={current_lr:.3e}, "
                 f"data_loss={LAMBDA_DATA * total_data_loss:.4e}, "
                 f"PDE_loss={LAMBDA_PDE * total_pde_loss:.4e}, "
                 f"rel_err_train(avg)={avg_rel_err_tr:.4e}, "
