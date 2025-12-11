@@ -135,8 +135,9 @@ def objective(
     # 学習を実行（プロットなし）
     history = gnn.train_gnn_auto_trainval_pde_weighted(
         data_dir,
-        enable_plot=False,
+        enable_plot=False,          # 探索中はリアルタイムプロットもオフ
         return_history=True,
+        enable_error_plots=False,   # ★ 探索中は誤差場プロットも完全オフ
     )
 
     # 目的関数として最小検証相対誤差を返す
@@ -179,6 +180,8 @@ def main() -> None:
 
     sampler = optuna.samplers.TPESampler(seed=args.random_seed)
     study = optuna.create_study(direction="minimize", sampler=sampler)
+
+    # Optuna 探索本体
     study.optimize(
         lambda trial: objective(
             trial,
@@ -193,11 +196,44 @@ def main() -> None:
         show_progress_bar=True,
     )
 
+    # ベストトライアル情報を表示
     print("=== Best trial ===")
     print(f"  value (min val rel err): {study.best_trial.value:.4e}")
     print("  params:")
     for k, v in study.best_trial.params.items():
         print(f"    {k}: {v}")
+
+    # ============================================================
+    # ★ ベストトライアルのハイパーパラメータで 1 回だけ再学習し、
+    #    このときだけ誤差場プロットを出す
+    # ============================================================
+    best = study.best_trial
+    print("\n[INFO] ベストトライアルのハイパーパラメータで再学習を実行します。")
+
+    # gnn 側のグローバル設定を引数に合わせて再セット
+    gnn.NUM_EPOCHS      = args.num_epochs
+    gnn.MAX_NUM_CASES   = args.max_num_cases
+    gnn.TRAIN_FRACTION  = args.train_fraction
+    gnn.RANDOM_SEED     = args.random_seed
+
+    # ベストトライアルのハイパーパラメータを gnn 側に反映
+    gnn.LR              = best.params["lr"]
+    gnn.WEIGHT_DECAY    = best.params["weight_decay"]
+    gnn.LAMBDA_DATA     = best.params["lambda_data"]
+    gnn.LAMBDA_PDE      = best.params["lambda_pde"]
+    gnn.HIDDEN_CHANNELS = best.params["hidden_channels"]
+    gnn.NUM_LAYERS      = best.params["num_layers"]
+
+    # ★ この呼び出しだけ誤差場プロットを有効化
+    #   enable_plot はお好みで True/False を選んでください
+    gnn.train_gnn_auto_trainval_pde_weighted(
+        args.data_dir,
+        enable_plot=False,          # 学習曲線のポップアップが不要なら False
+        return_history=False,       # ここでは履歴は使わないので False
+        enable_error_plots=True,    # ← ベスト設定のときだけ誤差場 PNG を出力
+    )
+
+    print("[INFO] ベスト設定での再学習と誤差場プロット出力が完了しました。")
 
 
 if __name__ == "__main__":

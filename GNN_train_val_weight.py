@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # 3Dプロット用（projection="3d"で内部的に使用）
 import time
 from datetime import datetime
 # 日本語フォントを指定（インストール済みのものから選ぶ）
@@ -69,6 +70,12 @@ RANDOM_SEED = 42  # train/val をランダム分割するためのシード
 
 # 可視化の更新間隔（エポック）
 PLOT_INTERVAL = 10
+
+# 誤差場可視化用の設定
+MAX_ERROR_PLOT_CASES_TRAIN = 3   # train ケースで誤差図を出す最大件数
+MAX_ERROR_PLOT_CASES_VAL   = 3   # val ケースで誤差図を出す最大件数
+MAX_POINTS_3D_SCATTER      = 50000  # 3D散布図でプロットする最大セル数（それ以上ならランダムサンプリング）
+YSLICE_FRACTIONAL_HALF_WIDTH = 0.05  # y中央断面として扱う帯の半幅（全高さに対する 5%）
 
 # ログファイル用
 LOGGER_FILE = None
@@ -137,6 +144,57 @@ def find_time_rank_list(data_dir: str):
         key=lambda tr: (float(tr[0]), int(tr[1]))
     )
     return time_rank_tuples
+
+
+def compute_affine_fit(x_true_tensor, x_pred_tensor):
+    """
+    x_true ≈ a * x_pred + b となるように、
+    最小二乗で a, b を求める簡易診断用関数。
+
+    Parameters
+    ----------
+    x_true_tensor : torch.Tensor, shape (N,)
+        物理スケールの真値（正規化解除後）
+    x_pred_tensor : torch.Tensor, shape (N,)
+        物理スケールの予測値（正規化解除後）
+
+    Returns
+    -------
+    a : float
+        最適スケール係数
+    b : float
+        最適バイアス
+    rmse_before : float
+        補正前 RMSE = sqrt(mean((x_pred - x_true)^2))
+    rmse_after : float
+        補正後 RMSE = sqrt(mean((a*x_pred + b - x_true)^2))
+    """
+    # CPU / numpy に変換して 1 次元にフラット化
+    xp = x_pred_tensor.detach().cpu().double().view(-1).numpy()
+    yt = x_true_tensor.detach().cpu().double().view(-1).numpy()
+
+    n = xp.size
+    if n == 0:
+        return 1.0, 0.0, float("nan"), float("nan")
+
+    sx = xp.sum()
+    sy = yt.sum()
+    sxx = (xp * xp).sum()
+    sxy = (xp * yt).sum()
+
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-30:
+        # x_pred がほぼ定数の場合はスケールをいじれないので、そのままとみなす
+        a = 1.0
+        b = 0.0
+    else:
+        a = (n * sxy - sx * sy) / denom
+        b = (sy - a * sx) / n
+
+    rmse_before = float(np.sqrt(((xp - yt) ** 2).mean()))
+    rmse_after = float(np.sqrt(((a * xp + b - yt) ** 2).mean()))
+
+    return a, b, rmse_before, rmse_after
 
 
 # ------------------------------------------------------------
@@ -451,7 +509,143 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
         "row_idx": row_idx,
         "w_pde": w_pde,
         "w_pde_np": w_pde_np,  # ★ 分布ログ用に numpy を保持しておく
+
+        # ★ 誤差場可視化用に元の座標・品質指標も持たせる
+        "coords_np": feats_np[:, 0:3].copy(),   # [x, y, z]
+        "skew_np": feats_np[:, 5].copy(),
+        "non_ortho_np": feats_np[:, 6].copy(),
+        "aspect_np": feats_np[:, 7].copy(),
+        "size_jump_np": feats_np[:, 11].copy(),
     }
+
+def save_error_field_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
+    """
+    誤差場 (x_pred - x_true) の 3D 散布図と、
+    y ≒ 中央断面での 2D カラーマップ（誤差 vs w_pde）を保存する。
+
+    さらに |誤差| と w_pde の簡単な統計（相関係数、誤差上位5%セルの平均w_pde など）をログ出力する。
+    """
+    # ---- Torch -> NumPy ----
+    x_pred_np = x_pred.detach().cpu().numpy().reshape(-1)
+    x_true_np = x_true.detach().cpu().numpy().reshape(-1)
+    err       = x_pred_np - x_true_np
+    abs_err   = np.abs(err)
+
+    coords    = cs["coords_np"]      # (N, 3) : x, y, z
+    w_pde_np  = cs["w_pde_np"]       # (N,)
+
+    N = coords.shape[0]
+    if err.shape[0] != N:
+        log_print(f"    [WARN] 誤差場可視化: 座標数 N={N} と解ベクトル長={err.shape[0]} が一致しません ({prefix})。")
+        return
+
+    # ============================
+    # 1) 3D 散布図 (x, y, z, color = x_pred - x_true)
+    # ============================
+    if N > MAX_POINTS_3D_SCATTER:
+        idx = np.random.choice(N, size=MAX_POINTS_3D_SCATTER, replace=False)
+        log_print(f"    [PLOT] 3D 散布図用に {N} セル中 {idx.size} セルをサンプリングしました ({prefix}).")
+    else:
+        idx = np.arange(N)
+
+    xs = coords[idx, 0]
+    ys = coords[idx, 1]
+    zs = coords[idx, 2]
+    err_sample = err[idx]
+
+    vmax = np.max(np.abs(err_sample)) + 1e-20
+    vmin = -vmax
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    sc = ax.scatter(xs, ys, zs, c=err_sample, s=2, cmap="coolwarm", vmin=vmin, vmax=vmax)
+    cbar = fig.colorbar(sc, ax=ax, shrink=0.7)
+    cbar.set_label("x_pred - x_true")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.set_title(f"誤差場 3D散布図 ({prefix})")
+    fig.tight_layout()
+
+    out3d = os.path.join(output_dir, f"error3d_{prefix}.png")
+    fig.savefig(out3d, dpi=200)
+    plt.close(fig)
+
+    log_print(f"    [PLOT] 誤差場 3D 散布図を {out3d} に保存しました。")
+
+    # ============================
+    # 2) y ≒ 中央断面での 2D カラーマップ
+    #    左: |x_pred - x_true|, 右: w_pde
+    # ============================
+    y = coords[:, 1]
+    y_min, y_max = float(y.min()), float(y.max())
+    if y_max > y_min:
+        y_mid = 0.5 * (y_min + y_max)
+        band  = YSLICE_FRACTIONAL_HALF_WIDTH * (y_max - y_min)
+    else:
+        # 全セル同一 y の場合
+        y_mid = y_min
+        band  = 1e-6
+
+    mask = np.abs(y - y_mid) <= band
+    n_slice = int(np.count_nonzero(mask))
+
+    if n_slice < 10:
+        log_print(f"    [PLOT] y≈中央断面のセル数が {n_slice} と少ないため 2D カラーマップをスキップします ({prefix}).")
+    else:
+        xs2       = coords[mask, 0]
+        zs2       = coords[mask, 2]
+        abs_err2  = abs_err[mask]
+        w_pde2    = w_pde_np[mask]
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        sc0 = axes[0].scatter(xs2, zs2, c=abs_err2, s=5)
+        axes[0].set_aspect("equal", adjustable="box")
+        axes[0].set_xlabel("x")
+        axes[0].set_ylabel("z")
+        axes[0].set_title("誤差場 |x_pred - x_true| (y ≒ 中央断面)")
+        cbar0 = fig.colorbar(sc0, ax=axes[0])
+        cbar0.set_label("|x_pred - x_true|")
+
+        sc1 = axes[1].scatter(xs2, zs2, c=w_pde2, s=5)
+        axes[1].set_aspect("equal", adjustable="box")
+        axes[1].set_xlabel("x")
+        axes[1].set_ylabel("z")
+        axes[1].set_title("w_pde (メッシュ品質重み, y ≒ 中央断面)")
+        cbar1 = fig.colorbar(sc1, ax=axes[1])
+        cbar1.set_label("w_pde")
+
+        fig.tight_layout()
+        out2d = os.path.join(output_dir, f"error2d_yMid_{prefix}.png")
+        fig.savefig(out2d, dpi=200)
+        plt.close(fig)
+
+        log_print(f"    [PLOT] 誤差場と w_pde の 2D カラーマップを {out2d} に保存しました。")
+
+    # ============================
+    # 3) |誤差| と w_pde の簡単な統計
+    # ============================
+    if N >= 10:
+        if np.std(abs_err) > 0.0 and np.std(w_pde_np) > 0.0:
+            corr = float(np.corrcoef(abs_err, w_pde_np)[0, 1])
+        else:
+            corr = float("nan")
+
+        top_frac = 0.05  # 誤差上位5%を見る
+        k = max(1, int(top_frac * N))
+        idx_sorted = np.argsort(-abs_err)  # 大きい順
+        top_idx = idx_sorted[:k]
+
+        mean_w_all = float(w_pde_np.mean())
+        mean_w_top = float(w_pde_np[top_idx].mean())
+
+        log_print(
+            "    [STATS] |誤差| と w_pde の簡易統計: "
+            f"corr(|err|, w_pde)={corr:.3f}, "
+            f"top{int(top_frac*100)}%誤差セルの平均w_pde={mean_w_top:.3e}, "
+            f"全セル平均w_pde={mean_w_all:.3e}"
+        )
 
 # ------------------------------------------------------------
 # 可視化ユーティリティ
@@ -540,6 +734,7 @@ def train_gnn_auto_trainval_pde_weighted(
     *,
     enable_plot: bool = True,
     return_history: bool = False,
+    enable_error_plots: bool = False,  # ★ 追加：誤差場プロットを出すかどうか
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -655,6 +850,45 @@ def train_gnn_auto_trainval_pde_weighted(
     x_mean_t = torch.tensor(x_mean, dtype=torch.float32, device=device)
     x_std_t  = torch.tensor(x_std,  dtype=torch.float32, device=device)
 
+    # --- rank ごとの x_true 統計（train ケースのみ） ---
+    #     data loss を rank ごとに正規化するための mean/std
+    train_ranks = sorted({int(rc["rank"]) for rc in raw_cases_train})
+    num_ranks = max(train_ranks) + 1
+
+    sums   = np.zeros(num_ranks, dtype=np.float64)
+    sqsums = np.zeros(num_ranks, dtype=np.float64)
+    counts = np.zeros(num_ranks, dtype=np.int64)
+
+    for rc in raw_cases_train:
+        r = int(rc["rank"])
+        x = rc["x_true_np"].astype(np.float64).reshape(-1)
+        sums[r]   += x.sum()
+        sqsums[r] += np.square(x).sum()
+        counts[r] += x.size
+
+    # 初期値としてグローバル mean/std を入れておき、train に存在する rank だけ上書き
+    x_mean_rank = np.full(num_ranks, x_mean, dtype=np.float64)
+    x_std_rank  = np.full(num_ranks, x_std,  dtype=np.float64)
+
+    for r in range(num_ranks):
+        if counts[r] > 0:
+            mean_r = sums[r] / counts[r]
+            var_r  = sqsums[r] / counts[r] - mean_r * mean_r
+            std_r  = np.sqrt(max(var_r, 1e-24))
+            x_mean_rank[r] = mean_r
+            x_std_rank[r]  = std_r
+
+    log_print("[INFO] rank-wise x_true statistics (train only):")
+    for r in range(num_ranks):
+        log_print(
+            f"  rank={r}: count={counts[r]}, "
+            f"mean={x_mean_rank[r]:.3e}, std={x_std_rank[r]:.3e}"
+        )
+
+    # torch.Tensor (device 上) として保持
+    x_mean_rank_t = torch.from_numpy(x_mean_rank.astype(np.float32)).to(device)
+    x_std_rank_t  = torch.from_numpy(x_std_rank.astype(np.float32)).to(device)
+
     # --- torch ケース化 & w_pde 統計 ---
     cases_train = []
     cases_val   = []
@@ -755,9 +989,20 @@ def train_gnn_auto_trainval_pde_weighted(
             # 非正規化スケールに戻す
             x_pred = x_pred_norm * x_std_t + x_mean_t
 
-            # データ損失: 相対二乗誤差
-            diff = x_pred - x_true
-            data_loss_case = torch.sum(diff * diff) / (torch.sum(x_true * x_true) + EPS_DATA)
+            # rank ごとの mean/std を用いた x の正規化（data loss 用）
+            rank_id = int(cs["rank"])
+            mean_r  = x_mean_rank_t[rank_id]
+            std_r   = x_std_rank_t[rank_id]
+
+            # x_true, x_pred を rank ごとに標準化
+            x_true_norm_case = (x_true - mean_r) / (std_r + 1e-12)
+            x_pred_norm_case_for_loss = (x_pred - mean_r) / (std_r + 1e-12)
+
+            # データ損失: rank ごとに正規化した MSE
+            data_loss_case = F.mse_loss(
+                x_pred_norm_case_for_loss,
+                x_true_norm_case
+            )
 
             # PDE 損失: w_pde 付き相対残差²
             Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
@@ -775,6 +1020,8 @@ def train_gnn_auto_trainval_pde_weighted(
             total_pde_loss  = total_pde_loss  + pde_loss_case
 
             with torch.no_grad():
+                # rel_err, RMSE は従来どおり「物理スケール」で計算
+                diff = x_pred - x_true
                 N = x_true.shape[0]
                 rel_err_case = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
                 rmse_case    = torch.sqrt(torch.sum(diff * diff) / N)
@@ -966,6 +1213,10 @@ def train_gnn_auto_trainval_pde_weighted(
     # --- 最終評価: OpenFOAM 解との PDE 残差比較を含む ---
     log_print("\n=== Final diagnostics (train cases) ===")
     model.eval()
+
+    # ★ ここでカウンタを初期化（関数のこのスコープ内）
+    num_error_plots_train = 0
+
     for cs in cases_train:
         time_str   = cs["time"]
         rank_str   = cs["rank"]
@@ -1047,6 +1298,15 @@ def train_gnn_auto_trainval_pde_weighted(
             f"||r||/||Ax||={R_true_over_Ax.item():.5f}"
         )
 
+        # --- ここでスケール診断 ---
+        a, b, rmse_before, rmse_after = compute_affine_fit(x_true, x_pred)
+        log_print(
+            f"    [Affine fit x_pred->x_true] "
+            f"a={a:.3e}, b={b:.3e}, "
+            f"RMSE_before={rmse_before:.3e}, RMSE_after={rmse_after:.3e}, "
+            f"RMSE_ratio={rmse_after / rmse_before:.3f}"
+        )
+
         # 予測結果の書き出し
         x_pred_np = x_pred.cpu().numpy().reshape(-1)
         out_path = os.path.join(OUTPUT_DIR, f"x_pred_train_{time_str}_rank{rank_str}.dat")
@@ -1055,8 +1315,18 @@ def train_gnn_auto_trainval_pde_weighted(
                 f.write(f"{i} {val:.9e}\n")
         log_print(f"    [INFO] train x_pred を {out_path} に書き出しました。")
 
+        # ★ 誤差場の可視化（train ケース）
+        if enable_error_plots and num_error_plots_train < MAX_ERROR_PLOT_CASES_TRAIN:
+            prefix = f"train_time{time_str}_rank{rank_str}"
+            save_error_field_plots(cs, x_pred, x_true, prefix)
+            num_error_plots_train += 1
+
     if num_val > 0:
         log_print("\n=== Final diagnostics (val cases) ===")
+
+        # ★ val 側のカウンタもここで初期化
+        num_error_plots_val = 0
+
         for cs in cases_val:
             time_str   = cs["time"]
             rank_str   = cs["rank"]
@@ -1135,6 +1405,15 @@ def train_gnn_auto_trainval_pde_weighted(
                 f"||r||/||Ax||={R_true_over_Ax.item():.5f}"
             )
 
+            # --- ここでスケール診断 ---
+            a, b, rmse_before, rmse_after = compute_affine_fit(x_true, x_pred)
+            log_print(
+                f"    [Affine fit x_pred->x_true] "
+                f"a={a:.3e}, b={b:.3e}, "
+                f"RMSE_before={rmse_before:.3e}, RMSE_after={rmse_after:.3e}, "
+                f"RMSE_ratio={rmse_after / rmse_before:.3f}"
+            )
+
             x_pred_np = x_pred.cpu().numpy().reshape(-1)
             out_path = os.path.join(OUTPUT_DIR, f"x_pred_val_{time_str}_rank{rank_str}.dat")
             with open(out_path, "w") as f:
@@ -1142,6 +1421,12 @@ def train_gnn_auto_trainval_pde_weighted(
                     f.write(f"{i} {val:.9e}\n")
             log_print(f"    [INFO] val x_pred を {out_path} に書き出しました。")
 
+            # ★ 誤差場の可視化（val ケース）
+            if enable_error_plots and num_error_plots_val < MAX_ERROR_PLOT_CASES_VAL:
+                prefix = f"val_time{time_str}_rank{rank_str}"
+                save_error_field_plots(cs, x_pred, x_true, prefix)
+                num_error_plots_val += 1
+                                
     if return_history:
         return history
 
