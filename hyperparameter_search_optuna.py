@@ -197,12 +197,33 @@ def main() -> None:
         action="store_true",
         help="混合精度学習 (AMP) を無効化",
     )
+    parser.add_argument(
+        "--cache",
+        action="store_true",
+        default=True,
+        help="データキャッシュを有効化（デフォルト: 有効）",
+    )
+    parser.add_argument(
+        "--no_cache",
+        action="store_true",
+        help="データキャッシュを無効化（毎回ファイルから読み込む）",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=".cache",
+        help="キャッシュファイルの保存先ディレクトリ（デフォルト: .cache）",
+    )
 
     args = parser.parse_args()
 
     # メモリ効率化オプションの設定
     gnn.USE_LAZY_LOADING = not args.no_lazy_loading
     gnn.USE_AMP = not args.no_amp
+
+    # データキャッシュオプションの設定
+    gnn.USE_DATA_CACHE = not args.no_cache
+    gnn.CACHE_DIR = args.cache_dir
 
     sampler = optuna.samplers.TPESampler(seed=args.random_seed)
     study = optuna.create_study(direction="minimize", sampler=sampler)
