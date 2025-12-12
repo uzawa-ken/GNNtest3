@@ -426,6 +426,15 @@ class SimpleSAGE(nn.Module):
 # ------------------------------------------------------------
 
 def matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x):
+    """
+    CSR 形式の疎行列とベクトルの積を計算する。
+    AMP 使用時に型の不一致が発生する場合は、自動的に型を揃える。
+    """
+    # AMP 使用時、x が half (FP16) で vals が float (FP32) の場合がある
+    # 計算精度を保つため、x を vals の型に揃える
+    if x.dtype != vals.dtype:
+        x = x.to(vals.dtype)
+
     y = torch.zeros_like(x)
     y.index_add_(0, row_idx, vals * x[col_ind])
     return y
