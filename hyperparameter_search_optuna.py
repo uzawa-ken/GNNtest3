@@ -175,8 +175,34 @@ def main() -> None:
         default=Path("optuna_trials_history.tsv"),
         help="試行番号と検証誤差を逐次追記するログファイルのパス",
     )
+    parser.add_argument(
+        "--lazy_loading",
+        action="store_true",
+        default=True,
+        help="遅延GPU転送を有効化（デフォルト: 有効）",
+    )
+    parser.add_argument(
+        "--no_lazy_loading",
+        action="store_true",
+        help="遅延GPU転送を無効化",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        default=True,
+        help="混合精度学習 (AMP) を有効化（デフォルト: 有効）",
+    )
+    parser.add_argument(
+        "--no_amp",
+        action="store_true",
+        help="混合精度学習 (AMP) を無効化",
+    )
 
     args = parser.parse_args()
+
+    # メモリ効率化オプションの設定
+    gnn.USE_LAZY_LOADING = not args.no_lazy_loading
+    gnn.USE_AMP = not args.no_amp
 
     sampler = optuna.samplers.TPESampler(seed=args.random_seed)
     study = optuna.create_study(direction="minimize", sampler=sampler)
