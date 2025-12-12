@@ -145,6 +145,10 @@ LR_SCHED_MIN_LR = 1e-6         # 学習率の下限
 USE_LAZY_LOADING = True        # 遅延GPU転送（大規模データ向け）
 USE_AMP = True                 # 混合精度学習（Automatic Mixed Precision）
 
+# データキャッシュオプション（Optuna等での繰り返し学習を高速化）
+USE_DATA_CACHE = True          # データをキャッシュファイルに保存し、2回目以降は高速ロード
+CACHE_DIR = ".cache"           # キャッシュファイルの保存先ディレクトリ
+
 # 損失関数の重み
 LAMBDA_DATA = 0.1              # データ損失の重み
 LAMBDA_PDE  = 0.0001           # PDE 損失の重み
@@ -225,6 +229,48 @@ python hyperparameter_search_optuna.py --no_lazy_loading --trials 20 --data_dir 
 
 # AMP を無効化
 python hyperparameter_search_optuna.py --no_amp --trials 20 --data_dir ./data
+```
+
+### 6. データキャッシュ機能
+
+Optuna などで繰り返し学習を行う場合、データの読み込みとグラフ作成が毎回発生し、時間がかかります。データキャッシュ機能を使用すると、初回のみファイルから読み込み、2回目以降はキャッシュから高速にロードできます。
+
+#### 基本設定
+
+```python
+USE_DATA_CACHE = True     # デフォルト: 有効
+CACHE_DIR = ".cache"      # キャッシュファイルの保存先
+```
+
+- **動作**: 初回実行時に NumPy 配列レベルのデータを pickle 形式でキャッシュに保存。2回目以降はキャッシュから高速に読み込み
+- **効果**: Optuna の 2 試行目以降でデータ読み込み時間を大幅に短縮（特に大規模データで効果的）
+- **自動無効化**: ソースファイル（pEqn, x, A_csr）がキャッシュより新しい場合は自動的に再読み込み
+
+#### キャッシュの仕組み
+
+1. データディレクトリと (time, rank) ペアのリストからハッシュキーを生成
+2. `.cache/raw_cases_{hash}.pkl` としてキャッシュを保存
+3. 読み込み時にソースファイルの更新日時をチェックし、古いキャッシュは自動的に再作成
+
+#### Optuna での使用
+
+```bash
+# キャッシュ有効（デフォルト）
+python hyperparameter_search_optuna.py --trials 20 --data_dir ./data
+
+# キャッシュを無効化（毎回ファイルから読み込む）
+python hyperparameter_search_optuna.py --no_cache --trials 20 --data_dir ./data
+
+# キャッシュディレクトリを指定
+python hyperparameter_search_optuna.py --cache_dir /tmp/gnn_cache --trials 20 --data_dir ./data
+```
+
+#### キャッシュのクリア
+
+キャッシュを手動でクリアしたい場合は、キャッシュディレクトリを削除してください：
+
+```bash
+rm -rf .cache
 ```
 
 ## 検証誤差が頭打ちになるときのチェックリスト

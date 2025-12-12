@@ -24,6 +24,8 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # 3Dプロット用（projection="3d"で内部的に使用）
 import time
 from datetime import datetime
+import pickle
+import hashlib
 # 日本語フォントを指定（インストール済みのものから選ぶ）
 plt.rcParams['font.family'] = 'IPAexGothic'    # or 'Noto Sans CJK JP' など
 # マイナス記号が文字化けする場合の対策
@@ -60,6 +62,10 @@ LR_SCHED_MIN_LR = 1e-6
 # メモリ効率化オプション
 USE_LAZY_LOADING = True   # データをCPUに保持し、使用時のみGPUへ転送
 USE_AMP = True            # 混合精度学習（Automatic Mixed Precision）を有効化
+
+# データキャッシュオプション（Optuna等での繰り返し学習を高速化）
+USE_DATA_CACHE = True     # データをキャッシュファイルに保存し、2回目以降は高速ロード
+CACHE_DIR = ".cache"      # キャッシュファイルの保存先ディレクトリ
 
 LAMBDA_DATA = 0.1
 LAMBDA_PDE  = 0.0001
@@ -148,6 +154,72 @@ def find_time_rank_list(data_dir: str):
         key=lambda tr: (float(tr[0]), int(tr[1]))
     )
     return time_rank_tuples
+
+
+# ------------------------------------------------------------
+# データキャッシュ機能
+# ------------------------------------------------------------
+
+def _compute_cache_key(data_dir: str, time_rank_tuples: list) -> str:
+    """
+    キャッシュのキー（ハッシュ）を計算する。
+    データディレクトリと (time, rank, gnn_dir) タプルのリストから一意のキーを生成。
+    """
+    key_str = data_dir + "|" + str(sorted(time_rank_tuples))
+    return hashlib.md5(key_str.encode()).hexdigest()[:16]
+
+
+def _get_cache_path(data_dir: str, time_rank_tuples: list) -> str:
+    """キャッシュファイルのパスを取得する。"""
+    cache_key = _compute_cache_key(data_dir, time_rank_tuples)
+    return os.path.join(CACHE_DIR, f"raw_cases_{cache_key}.pkl")
+
+
+def _is_cache_valid(cache_path: str, time_rank_tuples: list) -> bool:
+    """
+    キャッシュが有効かどうかを確認する。
+    - キャッシュファイルが存在するか
+    - ソースファイルよりキャッシュが新しいか
+    """
+    if not os.path.exists(cache_path):
+        return False
+
+    cache_mtime = os.path.getmtime(cache_path)
+
+    # 各ソースファイルの最終更新時刻をチェック
+    for time_str, rank_str, gnn_dir in time_rank_tuples:
+        p_path = os.path.join(gnn_dir, f"pEqn_{time_str}_rank{rank_str}.dat")
+        x_path = os.path.join(gnn_dir, f"x_{time_str}_rank{rank_str}.dat")
+        csr_path = os.path.join(gnn_dir, f"A_csr_{time_str}.dat")
+        csr_path_with_rank = os.path.join(gnn_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
+
+        for path in [p_path, x_path]:
+            if os.path.exists(path) and os.path.getmtime(path) > cache_mtime:
+                return False
+
+        # CSR ファイルは両形式に対応
+        if os.path.exists(csr_path) and os.path.getmtime(csr_path) > cache_mtime:
+            return False
+        if os.path.exists(csr_path_with_rank) and os.path.getmtime(csr_path_with_rank) > cache_mtime:
+            return False
+
+    return True
+
+
+def save_raw_cases_to_cache(raw_cases: list, cache_path: str) -> None:
+    """raw_cases をキャッシュファイルに保存する。"""
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, "wb") as f:
+        pickle.dump(raw_cases, f, protocol=pickle.HIGHEST_PROTOCOL)
+    log_print(f"[CACHE] データを {cache_path} にキャッシュしました")
+
+
+def load_raw_cases_from_cache(cache_path: str) -> list:
+    """キャッシュファイルから raw_cases を読み込む。"""
+    with open(cache_path, "rb") as f:
+        raw_cases = pickle.load(f)
+    log_print(f"[CACHE] キャッシュ {cache_path} からデータを読み込みました")
+    return raw_cases
 
 
 def compute_affine_fit(x_true_tensor, x_pred_tensor):
@@ -860,14 +932,32 @@ def train_gnn_auto_trainval_pde_weighted(
 
 
     # --- raw ケース読み込み（train + val 両方） ---
+    # キャッシュが有効な場合はキャッシュから読み込み、そうでなければファイルから読み込んでキャッシュ
+    raw_cases_all = []
+    cache_path = _get_cache_path(data_dir, all_time_rank_tuples) if USE_DATA_CACHE else None
+
+    if USE_DATA_CACHE and _is_cache_valid(cache_path, all_time_rank_tuples):
+        # キャッシュから読み込み（高速）
+        raw_cases_all = load_raw_cases_from_cache(cache_path)
+    else:
+        # ファイルから読み込み
+        for t, r, g in all_time_rank_tuples:
+            log_print(f"[LOAD] time={t}, rank={r} のグラフ+PDE情報を読み込み中...")
+            rc = load_case_with_csr(g, t, r)
+            raw_cases_all.append(rc)
+
+        # キャッシュに保存
+        if USE_DATA_CACHE:
+            save_raw_cases_to_cache(raw_cases_all, cache_path)
+
+    # train/val に分割
     raw_cases_train = []
     raw_cases_val   = []
-
     train_set = set(tuples_train)
-    for t, r, g in all_time_rank_tuples:
-        log_print(f"[LOAD] time={t}, rank={r} のグラフ+PDE情報を読み込み中...")
-        rc = load_case_with_csr(g, t, r)
-        if (t, r, g) in train_set:
+
+    for rc in raw_cases_all:
+        key = (rc["time"], rc["rank"], rc["gnn_dir"])
+        if key in train_set:
             raw_cases_train.append(rc)
         else:
             raw_cases_val.append(rc)
