@@ -141,6 +141,10 @@ LR_SCHED_FACTOR = 0.5          # 学習率を何倍に下げるか
 LR_SCHED_PATIENCE = 20         # 何エポック改善が無ければ下げるか
 LR_SCHED_MIN_LR = 1e-6         # 学習率の下限
 
+# メモリ効率化オプション
+USE_LAZY_LOADING = True        # 遅延GPU転送（大規模データ向け）
+USE_AMP = True                 # 混合精度学習（Automatic Mixed Precision）
+
 # 損失関数の重み
 LAMBDA_DATA = 0.1              # データ損失の重み
 LAMBDA_PDE  = 0.0001           # PDE 損失の重み
@@ -185,6 +189,43 @@ python GNN_train_val_weight.py
     - （自動探索対象）`lr`, `weight_decay`, `lambda_data`, `lambda_pde`, `hidden_channels`, `num_layers`
 
 3. 実行後、最小の検証誤差と最適パラメータがコンソールに表示されます。また、ログファイルには各試行の番号と検証誤差が時系列で追記されます。
+
+### 5. メモリ効率化オプション
+
+大規模グラフ（セル数が多い、または多数のケースを学習する場合）でGPUメモリ不足が発生する場合、以下のオプションが有効です。
+
+#### 遅延GPU転送（Lazy Loading）
+
+```python
+USE_LAZY_LOADING = True  # デフォルト: 有効
+```
+
+- **動作**: データを CPU メモリに保持し、学習時に必要なケースのみ GPU に転送
+- **効果**: GPU メモリ使用量を大幅に削減（ケース数に依存しなくなる）
+- **トレードオフ**: データ転送のオーバーヘッドにより、学習速度がやや低下
+
+#### 混合精度学習（AMP: Automatic Mixed Precision）
+
+```python
+USE_AMP = True  # デフォルト: 有効（CUDA 環境のみ）
+```
+
+- **動作**: 順伝播と損失計算を FP16/BF16 で実行し、勾配スケーリングで数値安定性を確保
+- **効果**: GPU メモリ使用量を約 50% 削減、学習速度が向上（最新 GPU では特に効果的）
+- **要件**: CUDA 対応 GPU が必要（CPU モードでは自動的に無効化）
+
+#### Optuna での使用
+
+```bash
+# 両方有効（デフォルト）
+python hyperparameter_search_optuna.py --trials 20 --data_dir ./data
+
+# 遅延GPU転送を無効化
+python hyperparameter_search_optuna.py --no_lazy_loading --trials 20 --data_dir ./data
+
+# AMP を無効化
+python hyperparameter_search_optuna.py --no_amp --trials 20 --data_dir ./data
+```
 
 ## 検証誤差が頭打ちになるときのチェックリスト
 

@@ -57,6 +57,10 @@ LR_SCHED_FACTOR = 0.5
 LR_SCHED_PATIENCE = 20
 LR_SCHED_MIN_LR = 1e-6
 
+# メモリ効率化オプション
+USE_LAZY_LOADING = True   # データをCPUに保持し、使用時のみGPUへ転送
+USE_AMP = True            # 混合精度学習（Automatic Mixed Precision）を有効化
+
 LAMBDA_DATA = 0.1
 LAMBDA_PDE  = 0.0001
 
@@ -471,7 +475,16 @@ def build_w_pde_from_feats(feats_np: np.ndarray,
 # raw_case → torch case への変換ヘルパ
 # ------------------------------------------------------------
 
-def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, device):
+def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, device, lazy_load=False):
+    """
+    raw_case を torch テンソルに変換する。
+
+    Parameters
+    ----------
+    lazy_load : bool
+        True の場合、データを CPU 上に保持し、GPU への転送は行わない。
+        学習時に move_case_to_device() で必要なときだけ GPU に転送する。
+    """
     feats_np  = rc["feats_np"]
     x_true_np = rc["x_true_np"]
 
@@ -481,18 +494,21 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
     # ★ ここで w_pde_np を計算
     w_pde_np = build_w_pde_from_feats(feats_np)
 
-    feats       = torch.from_numpy(feats_norm).float().to(device)
-    edge_index  = torch.from_numpy(rc["edge_index_np"]).long().to(device)
-    x_true      = torch.from_numpy(x_true_np).float().to(device)
-    x_true_norm = torch.from_numpy(x_true_norm_np).float().to(device)
+    # lazy_load が True の場合は CPU に保持、False の場合は直接 device へ
+    target_device = torch.device("cpu") if lazy_load else device
 
-    b       = torch.from_numpy(rc["b_np"]).float().to(device)
-    row_ptr = torch.from_numpy(rc["row_ptr_np"]).long().to(device)
-    col_ind = torch.from_numpy(rc["col_ind_np"]).long().to(device)
-    vals    = torch.from_numpy(rc["vals_np"]).float().to(device)
-    row_idx = torch.from_numpy(rc["row_idx_np"]).long().to(device)
+    feats       = torch.from_numpy(feats_norm).float().to(target_device)
+    edge_index  = torch.from_numpy(rc["edge_index_np"]).long().to(target_device)
+    x_true      = torch.from_numpy(x_true_np).float().to(target_device)
+    x_true_norm = torch.from_numpy(x_true_norm_np).float().to(target_device)
 
-    w_pde = torch.from_numpy(w_pde_np).float().to(device)
+    b       = torch.from_numpy(rc["b_np"]).float().to(target_device)
+    row_ptr = torch.from_numpy(rc["row_ptr_np"]).long().to(target_device)
+    col_ind = torch.from_numpy(rc["col_ind_np"]).long().to(target_device)
+    vals    = torch.from_numpy(rc["vals_np"]).float().to(target_device)
+    row_idx = torch.from_numpy(rc["row_idx_np"]).long().to(target_device)
+
+    w_pde = torch.from_numpy(w_pde_np).float().to(target_device)
 
     return {
         "time": rc["time"],
@@ -516,6 +532,34 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
         "non_ortho_np": feats_np[:, 6].copy(),
         "aspect_np": feats_np[:, 7].copy(),
         "size_jump_np": feats_np[:, 11].copy(),
+    }
+
+
+def move_case_to_device(cs, device):
+    """
+    ケースデータを指定デバイスに転送する（遅延ロード用）。
+    non_blocking=True で非同期転送を行い、オーバーヘッドを軽減。
+    """
+    return {
+        "time": cs["time"],
+        "rank": cs["rank"],
+        "gnn_dir": cs["gnn_dir"],
+        "feats": cs["feats"].to(device, non_blocking=True),
+        "edge_index": cs["edge_index"].to(device, non_blocking=True),
+        "x_true": cs["x_true"].to(device, non_blocking=True),
+        "x_true_norm": cs["x_true_norm"].to(device, non_blocking=True),
+        "b": cs["b"].to(device, non_blocking=True),
+        "row_ptr": cs["row_ptr"].to(device, non_blocking=True),
+        "col_ind": cs["col_ind"].to(device, non_blocking=True),
+        "vals": cs["vals"].to(device, non_blocking=True),
+        "row_idx": cs["row_idx"].to(device, non_blocking=True),
+        "w_pde": cs["w_pde"].to(device, non_blocking=True),
+        "w_pde_np": cs["w_pde_np"],
+        "coords_np": cs["coords_np"],
+        "skew_np": cs["skew_np"],
+        "non_ortho_np": cs["non_ortho_np"],
+        "aspect_np": cs["aspect_np"],
+        "size_jump_np": cs["size_jump_np"],
     }
 
 def save_error_field_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
@@ -890,17 +934,27 @@ def train_gnn_auto_trainval_pde_weighted(
     x_std_rank_t  = torch.from_numpy(x_std_rank.astype(np.float32)).to(device)
 
     # --- torch ケース化 & w_pde 統計 ---
+    # USE_LAZY_LOADING が True の場合、データは CPU に保持され、学習時に GPU へ転送される
     cases_train = []
     cases_val   = []
     w_all_list  = []
 
+    if USE_LAZY_LOADING:
+        log_print("[INFO] 遅延GPU転送モード: データはCPUに保持され、使用時のみGPUへ転送されます")
+
     for rc in raw_cases_train:
-        cs = convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, device)
+        cs = convert_raw_case_to_torch_case(
+            rc, feat_mean, feat_std, x_mean, x_std, device,
+            lazy_load=USE_LAZY_LOADING
+        )
         cases_train.append(cs)
         w_all_list.append(cs["w_pde_np"].reshape(-1))
 
     for rc in raw_cases_val:
-        cs = convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, device)
+        cs = convert_raw_case_to_torch_case(
+            rc, feat_mean, feat_std, x_mean, x_std, device,
+            lazy_load=USE_LAZY_LOADING
+        )
         cases_val.append(cs)
         w_all_list.append(cs["w_pde_np"].reshape(-1))
 
@@ -946,6 +1000,15 @@ def train_gnn_auto_trainval_pde_weighted(
             verbose=False,
         )
 
+    # --- AMP (混合精度学習) の設定 ---
+    use_amp_actual = USE_AMP and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp_actual)
+    if use_amp_actual:
+        log_print("[INFO] 混合精度学習 (AMP) が有効です")
+    else:
+        if USE_AMP and device.type != "cuda":
+            log_print("[INFO] AMP は CUDA デバイスでのみ有効です。CPU モードでは無効化されます")
+
     log_print("=== Training start (relative data loss + weighted PDE loss, train/val split) ===")
 
     # --- 可視化用の準備 ---
@@ -974,47 +1037,55 @@ def train_gnn_auto_trainval_pde_weighted(
 
         # -------- train で勾配計算 --------
         for cs in cases_train:
-            feats       = cs["feats"]
-            edge_index  = cs["edge_index"]
-            x_true      = cs["x_true"]
-            b           = cs["b"]
-            row_ptr     = cs["row_ptr"]
-            col_ind     = cs["col_ind"]
-            vals        = cs["vals"]
-            row_idx     = cs["row_idx"]
-            w_pde       = cs["w_pde"]
+            # 遅延ロードの場合、ケースデータを GPU に転送
+            if USE_LAZY_LOADING:
+                cs_gpu = move_case_to_device(cs, device)
+            else:
+                cs_gpu = cs
 
-            # モデルは正規化スケールで出力
-            x_pred_norm = model(feats, edge_index)
-            # 非正規化スケールに戻す
-            x_pred = x_pred_norm * x_std_t + x_mean_t
+            feats       = cs_gpu["feats"]
+            edge_index  = cs_gpu["edge_index"]
+            x_true      = cs_gpu["x_true"]
+            b           = cs_gpu["b"]
+            row_ptr     = cs_gpu["row_ptr"]
+            col_ind     = cs_gpu["col_ind"]
+            vals        = cs_gpu["vals"]
+            row_idx     = cs_gpu["row_idx"]
+            w_pde       = cs_gpu["w_pde"]
 
-            # rank ごとの mean/std を用いた x の正規化（data loss 用）
-            rank_id = int(cs["rank"])
-            mean_r  = x_mean_rank_t[rank_id]
-            std_r   = x_std_rank_t[rank_id]
+            # AMP: autocast で順伝播と損失計算を FP16/BF16 で実行
+            with torch.cuda.amp.autocast(enabled=use_amp_actual):
+                # モデルは正規化スケールで出力
+                x_pred_norm = model(feats, edge_index)
+                # 非正規化スケールに戻す
+                x_pred = x_pred_norm * x_std_t + x_mean_t
 
-            # x_true, x_pred を rank ごとに標準化
-            x_true_norm_case = (x_true - mean_r) / (std_r + 1e-12)
-            x_pred_norm_case_for_loss = (x_pred - mean_r) / (std_r + 1e-12)
+                # rank ごとの mean/std を用いた x の正規化（data loss 用）
+                rank_id = int(cs["rank"])
+                mean_r  = x_mean_rank_t[rank_id]
+                std_r   = x_std_rank_t[rank_id]
 
-            # データ損失: rank ごとに正規化した MSE
-            data_loss_case = F.mse_loss(
-                x_pred_norm_case_for_loss,
-                x_true_norm_case
-            )
+                # x_true, x_pred を rank ごとに標準化
+                x_true_norm_case = (x_true - mean_r) / (std_r + 1e-12)
+                x_pred_norm_case_for_loss = (x_pred - mean_r) / (std_r + 1e-12)
 
-            # PDE 損失: w_pde 付き相対残差²
-            Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
-            r  = Ax - b
+                # データ損失: rank ごとに正規化した MSE
+                data_loss_case = F.mse_loss(
+                    x_pred_norm_case_for_loss,
+                    x_true_norm_case
+                )
 
-            sqrt_w = torch.sqrt(w_pde)
-            wr = sqrt_w * r
-            wb = sqrt_w * b
-            norm_wr = torch.norm(wr)
-            norm_wb = torch.norm(wb) + EPS_RES
-            R_pred = norm_wr / norm_wb
-            pde_loss_case = R_pred * R_pred
+                # PDE 損失: w_pde 付き相対残差²
+                Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+                r  = Ax - b
+
+                sqrt_w = torch.sqrt(w_pde)
+                wr = sqrt_w * r
+                wb = sqrt_w * b
+                norm_wr = torch.norm(wr)
+                norm_wb = torch.norm(wb) + EPS_RES
+                R_pred = norm_wr / norm_wb
+                pde_loss_case = R_pred * R_pred
 
             total_data_loss = total_data_loss + data_loss_case
             total_pde_loss  = total_pde_loss  + pde_loss_case
@@ -1030,12 +1101,20 @@ def train_gnn_auto_trainval_pde_weighted(
                 sum_R_pred_tr  += R_pred.detach().item()
                 sum_rmse_tr    += rmse_case.item()
 
+            # 遅延ロードの場合、GPU メモリを解放
+            if USE_LAZY_LOADING:
+                del cs_gpu
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
         total_data_loss = total_data_loss / num_train
         total_pde_loss  = total_pde_loss  / num_train
         loss = LAMBDA_DATA * total_data_loss + LAMBDA_PDE * total_pde_loss
 
-        loss.backward()
-        optimizer.step()
+        # AMP: スケーリングされた勾配で逆伝播
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         avg_rel_err_val = None
         avg_R_pred_val = None
@@ -1050,18 +1129,25 @@ def train_gnn_auto_trainval_pde_weighted(
             sum_rmse_val = 0.0
             with torch.no_grad():
                 for cs in cases_val:
-                    feats = cs["feats"]
-                    edge_index = cs["edge_index"]
-                    x_true = cs["x_true"]
-                    b = cs["b"]
-                    row_ptr = cs["row_ptr"]
-                    col_ind = cs["col_ind"]
-                    vals = cs["vals"]
-                    row_idx = cs["row_idx"]
-                    w_pde = cs["w_pde"]
+                    # 遅延ロードの場合、ケースデータを GPU に転送
+                    if USE_LAZY_LOADING:
+                        cs_gpu = move_case_to_device(cs, device)
+                    else:
+                        cs_gpu = cs
 
-                    x_pred_norm = model(feats, edge_index)
-                    x_pred = x_pred_norm * x_std_t + x_mean_t
+                    feats = cs_gpu["feats"]
+                    edge_index = cs_gpu["edge_index"]
+                    x_true = cs_gpu["x_true"]
+                    b = cs_gpu["b"]
+                    row_ptr = cs_gpu["row_ptr"]
+                    col_ind = cs_gpu["col_ind"]
+                    vals = cs_gpu["vals"]
+                    row_idx = cs_gpu["row_idx"]
+                    w_pde = cs_gpu["w_pde"]
+
+                    with torch.cuda.amp.autocast(enabled=use_amp_actual):
+                        x_pred_norm = model(feats, edge_index)
+                        x_pred = x_pred_norm * x_std_t + x_mean_t
 
                     diff = x_pred - x_true
                     rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
@@ -1080,6 +1166,12 @@ def train_gnn_auto_trainval_pde_weighted(
                     sum_rel_err_val += rel_err.item()
                     sum_R_pred_val += R_pred.item()
                     sum_rmse_val += rmse.item()
+
+                    # 遅延ロードの場合、GPU メモリを解放
+                    if USE_LAZY_LOADING:
+                        del cs_gpu
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
 
             avg_rel_err_val = sum_rel_err_val / num_val
             avg_R_pred_val = sum_R_pred_val / num_val
@@ -1111,18 +1203,25 @@ def train_gnn_auto_trainval_pde_weighted(
                 sum_rmse_val    = 0.0
                 with torch.no_grad():
                     for cs in cases_val:
-                        feats      = cs["feats"]
-                        edge_index = cs["edge_index"]
-                        x_true     = cs["x_true"]
-                        b          = cs["b"]
-                        row_ptr    = cs["row_ptr"]
-                        col_ind    = cs["col_ind"]
-                        vals       = cs["vals"]
-                        row_idx    = cs["row_idx"]
-                        w_pde      = cs["w_pde"]
+                        # 遅延ロードの場合、ケースデータを GPU に転送
+                        if USE_LAZY_LOADING:
+                            cs_gpu = move_case_to_device(cs, device)
+                        else:
+                            cs_gpu = cs
 
-                        x_pred_norm = model(feats, edge_index)
-                        x_pred = x_pred_norm * x_std_t + x_mean_t
+                        feats      = cs_gpu["feats"]
+                        edge_index = cs_gpu["edge_index"]
+                        x_true     = cs_gpu["x_true"]
+                        b          = cs_gpu["b"]
+                        row_ptr    = cs_gpu["row_ptr"]
+                        col_ind    = cs_gpu["col_ind"]
+                        vals       = cs_gpu["vals"]
+                        row_idx    = cs_gpu["row_idx"]
+                        w_pde      = cs_gpu["w_pde"]
+
+                        with torch.cuda.amp.autocast(enabled=use_amp_actual):
+                            x_pred_norm = model(feats, edge_index)
+                            x_pred = x_pred_norm * x_std_t + x_mean_t
 
                         diff = x_pred - x_true
                         rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
@@ -1141,6 +1240,12 @@ def train_gnn_auto_trainval_pde_weighted(
                         sum_rel_err_val += rel_err.item()
                         sum_R_pred_val  += R_pred.item()
                         sum_rmse_val    += rmse.item()
+
+                        # 遅延ロードの場合、GPU メモリを解放
+                        if USE_LAZY_LOADING:
+                            del cs_gpu
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
 
                 avg_rel_err_val = sum_rel_err_val / num_val
                 avg_R_pred_val  = sum_R_pred_val  / num_val
@@ -1220,19 +1325,27 @@ def train_gnn_auto_trainval_pde_weighted(
     for cs in cases_train:
         time_str   = cs["time"]
         rank_str   = cs["rank"]
-        feats      = cs["feats"]
-        edge_index = cs["edge_index"]
-        x_true     = cs["x_true"]
-        b          = cs["b"]
-        row_ptr    = cs["row_ptr"]
-        col_ind    = cs["col_ind"]
-        vals       = cs["vals"]
-        row_idx    = cs["row_idx"]
-        w_pde      = cs["w_pde"]
+
+        # 遅延ロードの場合、ケースデータを GPU に転送
+        if USE_LAZY_LOADING:
+            cs_gpu = move_case_to_device(cs, device)
+        else:
+            cs_gpu = cs
+
+        feats      = cs_gpu["feats"]
+        edge_index = cs_gpu["edge_index"]
+        x_true     = cs_gpu["x_true"]
+        b          = cs_gpu["b"]
+        row_ptr    = cs_gpu["row_ptr"]
+        col_ind    = cs_gpu["col_ind"]
+        vals       = cs_gpu["vals"]
+        row_idx    = cs_gpu["row_idx"]
+        w_pde      = cs_gpu["w_pde"]
 
         with torch.no_grad():
-            x_pred_norm = model(feats, edge_index)
-            x_pred = x_pred_norm * x_std_t + x_mean_t
+            with torch.cuda.amp.autocast(enabled=use_amp_actual):
+                x_pred_norm = model(feats, edge_index)
+                x_pred = x_pred_norm * x_std_t + x_mean_t
             diff = x_pred - x_true
             N = x_true.shape[0]
 
@@ -1321,6 +1434,12 @@ def train_gnn_auto_trainval_pde_weighted(
             save_error_field_plots(cs, x_pred, x_true, prefix)
             num_error_plots_train += 1
 
+        # 遅延ロードの場合、GPU メモリを解放
+        if USE_LAZY_LOADING:
+            del cs_gpu
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
     if num_val > 0:
         log_print("\n=== Final diagnostics (val cases) ===")
 
@@ -1330,19 +1449,27 @@ def train_gnn_auto_trainval_pde_weighted(
         for cs in cases_val:
             time_str   = cs["time"]
             rank_str   = cs["rank"]
-            feats      = cs["feats"]
-            edge_index = cs["edge_index"]
-            x_true     = cs["x_true"]
-            b          = cs["b"]
-            row_ptr    = cs["row_ptr"]
-            col_ind    = cs["col_ind"]
-            vals       = cs["vals"]
-            row_idx    = cs["row_idx"]
-            w_pde      = cs["w_pde"]
+
+            # 遅延ロードの場合、ケースデータを GPU に転送
+            if USE_LAZY_LOADING:
+                cs_gpu = move_case_to_device(cs, device)
+            else:
+                cs_gpu = cs
+
+            feats      = cs_gpu["feats"]
+            edge_index = cs_gpu["edge_index"]
+            x_true     = cs_gpu["x_true"]
+            b          = cs_gpu["b"]
+            row_ptr    = cs_gpu["row_ptr"]
+            col_ind    = cs_gpu["col_ind"]
+            vals       = cs_gpu["vals"]
+            row_idx    = cs_gpu["row_idx"]
+            w_pde      = cs_gpu["w_pde"]
 
             with torch.no_grad():
-                x_pred_norm = model(feats, edge_index)
-                x_pred = x_pred_norm * x_std_t + x_mean_t
+                with torch.cuda.amp.autocast(enabled=use_amp_actual):
+                    x_pred_norm = model(feats, edge_index)
+                    x_pred = x_pred_norm * x_std_t + x_mean_t
                 diff = x_pred - x_true
                 N = x_true.shape[0]
 
@@ -1426,7 +1553,13 @@ def train_gnn_auto_trainval_pde_weighted(
                 prefix = f"val_time{time_str}_rank{rank_str}"
                 save_error_field_plots(cs, x_pred, x_true, prefix)
                 num_error_plots_val += 1
-                                
+
+            # 遅延ロードの場合、GPU メモリを解放
+            if USE_LAZY_LOADING:
+                del cs_gpu
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
     if return_history:
         return history
 
