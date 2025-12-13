@@ -108,24 +108,38 @@ import glob
 def find_time_rank_list(data_dir: str):
     """
     DATA_DIR/processor*/gnn/ 内から全ての pEqn_{time}_rank{rank}.dat を走査し、
-    対応する x_{time}_rank{rank}.dat と A_csr_{time}.dat が
-    存在する (time, rank, gnn_dir) タプルのリストを返す。
+    対応する A_csr_{time}.dat が存在する (time, rank, gnn_dir) タプルのリストを返す。
+    x_{time}_rank{rank}.dat は教師なし学習モードでは省略可能。
 
     ディレクトリ構造:
         data/
         ├── processor2/gnn/
         │   ├── A_csr_{time}.dat
         │   ├── pEqn_{time}_rank2.dat
-        │   └── x_{time}_rank2.dat
+        │   └── x_{time}_rank2.dat  # 省略可
         ├── processor4/gnn/
         │   └── ...
         └── ...
+
+    Returns:
+        tuple: (time_rank_tuples, missing_files_info)
+            - time_rank_tuples: 有効な (time, rank, gnn_dir) タプルのリスト
+            - missing_files_info: 見つからなかったファイルの情報（辞書）
     """
     time_rank_tuples = []
     pattern = re.compile(r"^pEqn_(.+)_rank(\d+)\.dat$")
 
+    # 見つからなかったファイルを追跡
+    missing_pEqn = []
+    missing_csr = []
+    missing_x = []  # 警告用（教師なし学習では必須ではない）
+
     # data/processor*/gnn/ を探索
     gnn_dirs = glob.glob(os.path.join(data_dir, "processor*", "gnn"))
+
+    if not gnn_dirs:
+        # gnn ディレクトリ自体が見つからない場合
+        return [], {"no_gnn_dirs": True}
 
     for gnn_dir in gnn_dirs:
         if not os.path.isdir(gnn_dir):
@@ -144,16 +158,30 @@ def find_time_rank_list(data_dir: str):
             csr_path = os.path.join(gnn_dir, f"A_csr_{time_str}.dat")
             csr_path_with_rank = os.path.join(gnn_dir, f"A_csr_{time_str}_rank{rank_str}.dat")
 
-            if os.path.exists(x_path):
-                if os.path.exists(csr_path) or os.path.exists(csr_path_with_rank):
-                    time_rank_tuples.append((time_str, rank_str, gnn_dir))
+            has_csr = os.path.exists(csr_path) or os.path.exists(csr_path_with_rank)
+            has_x = os.path.exists(x_path)
+
+            if has_csr:
+                # pEqn と A_csr があれば有効（x は教師なし学習では省略可）
+                time_rank_tuples.append((time_str, rank_str, gnn_dir))
+                if not has_x:
+                    missing_x.append(x_path)
+            else:
+                missing_csr.append(csr_path)
 
     # time の数値順、次に rank の数値順でソート
     time_rank_tuples = sorted(
         set(time_rank_tuples),
         key=lambda tr: (float(tr[0]), int(tr[1]))
     )
-    return time_rank_tuples
+
+    missing_info = {
+        "missing_pEqn": missing_pEqn,
+        "missing_csr": missing_csr,
+        "missing_x": missing_x,
+    }
+
+    return time_rank_tuples, missing_info
 
 
 # ------------------------------------------------------------
@@ -910,11 +938,36 @@ def train_gnn_auto_trainval_pde_weighted(
     log_print(f"[INFO] device = {device}")
 
     # --- (time, rank, gnn_dir) タプルリスト検出 & 分割 ---
-    all_time_rank_tuples = find_time_rank_list(data_dir)
+    all_time_rank_tuples, missing_info = find_time_rank_list(data_dir)
+
     if not all_time_rank_tuples:
-        raise RuntimeError(
-            f"{data_dir}/processor*/gnn/ 内に pEqn_*_rank*.dat / x_*_rank*.dat / A_csr_*.dat が見つかりませんでした。"
-        )
+        # 見つからなかったファイルに応じてエラーメッセージを生成
+        if missing_info.get("no_gnn_dirs"):
+            raise RuntimeError(
+                f"{data_dir}/processor*/gnn/ ディレクトリが見つかりませんでした。"
+            )
+
+        error_messages = []
+        if missing_info.get("missing_csr"):
+            # CSR ファイルが見つからなかった場合
+            error_messages.append("A_csr_*.dat が見つかりませんでした。")
+        if not missing_info.get("missing_csr"):
+            # pEqn ファイルが見つからなかった場合（CSR はあるのに pEqn がない）
+            error_messages.append("pEqn_*_rank*.dat が見つかりませんでした。")
+
+        if error_messages:
+            raise RuntimeError(
+                f"{data_dir}/processor*/gnn/ 内に " + " ".join(error_messages)
+            )
+        else:
+            raise RuntimeError(
+                f"{data_dir}/processor*/gnn/ 内に有効なデータが見つかりませんでした。"
+            )
+
+    # x ファイルが見つからなかった場合は警告を表示（教師なし学習モードで続行）
+    if missing_info.get("missing_x"):
+        num_missing_x = len(missing_info["missing_x"])
+        log_print(f"[WARN] x_*_rank*.dat が {num_missing_x} 件見つかりませんでした。教師なし学習モードで続行します。")
 
     # 検出されたランクの一覧をログ出力
     all_ranks = sorted(set(r for _, r, _ in all_time_rank_tuples), key=int)
