@@ -389,7 +389,7 @@ $$
 Optuna のハイパーパラメータ最適化では、検証データに対する相対誤差の平均を最小化します：
 
 $$
-\text{val\_error} = \frac{1}{N_{\text{val}}} \sum_{k=1}^{N_{\text{val}}} \frac{\| x^{(k)}_{\text{pred}} - x^{(k)}_{\text{true}} \|_2}{\| x^{(k)}_{\text{true}} \|_2 + \epsilon}
+E_{\text{val}} = \frac{1}{N_{\text{val}}} \sum_{k=1}^{N_{\text{val}}} \frac{\| x^{(k)}_{\text{pred}} - x^{(k)}_{\text{true}} \|_2}{\| x^{(k)}_{\text{true}} \|_2 + \epsilon}
 $$
 
 教師なし学習モードでは、検証誤差の代わりに PDE 残差 $R$ を使用します。
