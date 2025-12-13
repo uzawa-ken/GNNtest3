@@ -69,6 +69,7 @@ CACHE_DIR = ".cache"      # キャッシュファイルの保存先ディレク�
 
 LAMBDA_DATA = 0.1
 LAMBDA_PDE  = 0.0001
+LAMBDA_GAUGE = 0.01  # ゲージ正則化係数（教師なし学習時の定数モード抑制用）
 
 W_PDE_MAX = 10.0  # w_pde の最大値
 
@@ -1216,6 +1217,7 @@ def train_gnn_auto_trainval_pde_weighted(
         "loss": [],
         "data_loss": [],
         "pde_loss": [],
+        "gauge_loss": [],  # ゲージ損失（教師なし学習時のみ）
         "rel_err_train": [],
         "rel_err_val": [],  # val が無いときは None
     }
@@ -1227,6 +1229,7 @@ def train_gnn_auto_trainval_pde_weighted(
 
         total_data_loss = 0.0
         total_pde_loss  = 0.0
+        total_gauge_loss = 0.0  # ゲージ損失（教師なし学習時の定数モード抑制用）
         sum_rel_err_tr  = 0.0
         sum_R_pred_tr   = 0.0
         sum_rmse_tr     = 0.0
@@ -1291,15 +1294,26 @@ def train_gnn_auto_trainval_pde_weighted(
                 R_pred = norm_wr / norm_wb
                 pde_loss_case = R_pred * R_pred
 
+                # ゲージ損失: x_pred の平均値の二乗（教師なし学習時の定数モード抑制用）
+                # 圧力ポアソン方程式の解は定数の不定性（ゲージ自由度）があるため、
+                # 平均ゼロに近づけることで解を一意に定める
+                gauge_loss_case = torch.mean(x_pred) ** 2
+
             total_data_loss = total_data_loss + data_loss_case
             total_pde_loss  = total_pde_loss  + pde_loss_case
+            total_gauge_loss = total_gauge_loss + gauge_loss_case
 
             with torch.no_grad():
                 # rel_err, RMSE: x_true がある場合のみ計算
                 if has_x_true and x_true is not None:
-                    diff = x_pred - x_true
+                    # ゲージ不変評価: 両者を平均ゼロに正規化してから比較
+                    # 圧力ポアソン方程式の解は定数の不定性があるため、
+                    # 公平な比較のために平均を引いてから誤差を計算
+                    x_pred_centered = x_pred - torch.mean(x_pred)
+                    x_true_centered = x_true - torch.mean(x_true)
+                    diff = x_pred_centered - x_true_centered
                     N = x_true.shape[0]
-                    rel_err_case = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
+                    rel_err_case = torch.norm(diff) / (torch.norm(x_true_centered) + EPS_DATA)
                     rmse_case    = torch.sqrt(torch.sum(diff * diff) / N)
                     sum_rel_err_tr += rel_err_case.item()
                     sum_rmse_tr    += rmse_case.item()
@@ -1311,13 +1325,16 @@ def train_gnn_auto_trainval_pde_weighted(
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
-        # 損失の計算（教師なし学習の場合は PDE 損失のみ）
+        # 損失の計算（教師なし学習の場合は PDE 損失 + ゲージ損失）
         total_pde_loss = total_pde_loss / num_train
+        total_gauge_loss = total_gauge_loss / num_train
         if unsupervised_mode or num_cases_with_x == 0:
-            # 教師なし学習: PDE 損失のみ
+            # 教師なし学習: PDE 損失 + ゲージ正則化
+            # ゲージ正則化は圧力ポアソンの定数モード（ゲージ自由度）を抑制
             total_data_loss = torch.tensor(0.0, device=device)
-            loss = LAMBDA_PDE * total_pde_loss
+            loss = LAMBDA_PDE * total_pde_loss + LAMBDA_GAUGE * total_gauge_loss
         else:
+            # 教師あり学習: データ損失 + PDE 損失（ゲージ正則化は不要、x_true が定数モードを固定）
             total_data_loss = total_data_loss / num_cases_with_x
             loss = LAMBDA_DATA * total_data_loss + LAMBDA_PDE * total_pde_loss
 
@@ -1363,8 +1380,11 @@ def train_gnn_auto_trainval_pde_weighted(
 
                     # rel_err, RMSE: x_true がある場合のみ計算
                     if has_x_true and x_true is not None:
-                        diff = x_pred - x_true
-                        rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
+                        # ゲージ不変評価: 両者を平均ゼロに正規化してから比較
+                        x_pred_centered = x_pred - torch.mean(x_pred)
+                        x_true_centered = x_true - torch.mean(x_true)
+                        diff = x_pred_centered - x_true_centered
+                        rel_err = torch.norm(diff) / (torch.norm(x_true_centered) + EPS_DATA)
                         N = x_true.shape[0]
                         rmse = torch.sqrt(torch.sum(diff * diff) / N)
                         sum_rel_err_val += rel_err.item()
@@ -1491,6 +1511,7 @@ def train_gnn_auto_trainval_pde_weighted(
             history["loss"].append(loss.item())
             history["data_loss"].append((LAMBDA_DATA * total_data_loss).item())
             history["pde_loss"].append((LAMBDA_PDE * total_pde_loss).item())
+            history["gauge_loss"].append((LAMBDA_GAUGE * total_gauge_loss).item())
             history["rel_err_train"].append(avg_rel_err_tr)
             history["rel_err_val"].append(avg_rel_err_val)  # None の可能性あり
 
@@ -1504,6 +1525,11 @@ def train_gnn_auto_trainval_pde_weighted(
                 f"lr={current_lr:.3e}, "
                 f"data_loss={LAMBDA_DATA * total_data_loss:.4e}, "
                 f"PDE_loss={LAMBDA_PDE * total_pde_loss:.4e}, "
+            )
+            if unsupervised_mode or num_cases_with_x == 0:
+                # 教師なし学習: ゲージ損失も表示
+                log += f"gauge_loss={LAMBDA_GAUGE * total_gauge_loss:.4e}, "
+            log += (
                 f"rel_err_train(avg)={avg_rel_err_tr:.4e}, "
 #                f"RMSE_train(avg)={avg_rmse_tr:.4e}, "
 #                f"R_pred_train(avg)={avg_R_pred_tr:.4e}"
