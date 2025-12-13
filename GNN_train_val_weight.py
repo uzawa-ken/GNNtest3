@@ -667,15 +667,21 @@ def move_case_to_device(cs, device):
     """
     ケースデータを指定デバイスに転送する（遅延ロード用）。
     non_blocking=True で非同期転送を行い、オーバーヘッドを軽減。
+    x_true が None の場合（教師なし学習）も対応。
     """
+    x_true = cs["x_true"]
+    x_true_norm = cs["x_true_norm"]
+    has_x_true = cs.get("has_x_true", x_true is not None)
+
     return {
         "time": cs["time"],
         "rank": cs["rank"],
         "gnn_dir": cs["gnn_dir"],
         "feats": cs["feats"].to(device, non_blocking=True),
         "edge_index": cs["edge_index"].to(device, non_blocking=True),
-        "x_true": cs["x_true"].to(device, non_blocking=True),
-        "x_true_norm": cs["x_true_norm"].to(device, non_blocking=True),
+        "x_true": x_true.to(device, non_blocking=True) if x_true is not None else None,
+        "x_true_norm": x_true_norm.to(device, non_blocking=True) if x_true_norm is not None else None,
+        "has_x_true": has_x_true,
         "b": cs["b"].to(device, non_blocking=True),
         "row_ptr": cs["row_ptr"].to(device, non_blocking=True),
         "col_ind": cs["col_ind"].to(device, non_blocking=True),
