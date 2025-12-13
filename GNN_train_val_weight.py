@@ -296,8 +296,8 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
 
     if not os.path.exists(p_path):
         raise FileNotFoundError(p_path)
-    if not os.path.exists(x_path):
-        raise FileNotFoundError(x_path)
+    # x ファイルは存在しなくてもよい（教師なし学習モード）
+    has_x_true = os.path.exists(x_path)
     if not os.path.exists(csr_path):
         raise FileNotFoundError(csr_path)
 
@@ -391,20 +391,25 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
         np.array(e_dst, dtype=np.int64)
     ])
 
-    x_true_np = np.zeros(len(cell_lines), dtype=np.float32)
-    with open(x_path, "r") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln:
-                continue
-            parts = ln.split()
-            if len(parts) != 2:
-                raise RuntimeError(f"x_*.dat の行形式が想定外です: {ln}")
-            cid = int(parts[0])
-            val = float(parts[1])
-            if not (0 <= cid < len(cell_lines)):
-                raise RuntimeError(f"x_*.dat の cell id が範囲外です: {cid}")
-            x_true_np[cid] = val
+    # x ファイルが存在する場合のみ読み込み（教師あり学習）
+    # 存在しない場合は None（教師なし学習 / PINNs モード）
+    if has_x_true:
+        x_true_np = np.zeros(len(cell_lines), dtype=np.float32)
+        with open(x_path, "r") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                parts = ln.split()
+                if len(parts) != 2:
+                    raise RuntimeError(f"x_*.dat の行形式が想定外です: {ln}")
+                cid = int(parts[0])
+                val = float(parts[1])
+                if not (0 <= cid < len(cell_lines)):
+                    raise RuntimeError(f"x_*.dat の cell id が範囲外です: {cid}")
+                x_true_np[cid] = val
+    else:
+        x_true_np = None
 
     with open(csr_path, "r") as f:
         csr_lines = [ln.strip() for ln in f if ln.strip()]
@@ -466,6 +471,7 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
         "feats_np": feats_np,
         "edge_index_np": edge_index_np,
         "x_true_np": x_true_np,
+        "has_x_true": has_x_true,  # 教師データの有無フラグ
         "b_np": b_np,
         "row_ptr_np": row_ptr_np,
         "col_ind_np": col_ind_np,
@@ -568,9 +574,15 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
     """
     feats_np  = rc["feats_np"]
     x_true_np = rc["x_true_np"]
+    has_x_true = rc.get("has_x_true", x_true_np is not None)
 
-    feats_norm     = (feats_np  - feat_mean) / feat_std
-    x_true_norm_np = (x_true_np - x_mean)   / x_std
+    feats_norm = (feats_np - feat_mean) / feat_std
+
+    # x_true が存在する場合のみ正規化（教師あり学習）
+    if has_x_true and x_true_np is not None:
+        x_true_norm_np = (x_true_np - x_mean) / x_std
+    else:
+        x_true_norm_np = None
 
     # ★ ここで w_pde_np を計算
     w_pde_np = build_w_pde_from_feats(feats_np)
@@ -580,8 +592,14 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
 
     feats       = torch.from_numpy(feats_norm).float().to(target_device)
     edge_index  = torch.from_numpy(rc["edge_index_np"]).long().to(target_device)
-    x_true      = torch.from_numpy(x_true_np).float().to(target_device)
-    x_true_norm = torch.from_numpy(x_true_norm_np).float().to(target_device)
+
+    # x_true が存在する場合のみテンソル化
+    if has_x_true and x_true_np is not None:
+        x_true      = torch.from_numpy(x_true_np).float().to(target_device)
+        x_true_norm = torch.from_numpy(x_true_norm_np).float().to(target_device)
+    else:
+        x_true      = None
+        x_true_norm = None
 
     b       = torch.from_numpy(rc["b_np"]).float().to(target_device)
     row_ptr = torch.from_numpy(rc["row_ptr_np"]).long().to(target_device)
@@ -599,6 +617,7 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
         "edge_index": edge_index,
         "x_true": x_true,
         "x_true_norm": x_true_norm,
+        "has_x_true": has_x_true,  # 教師データの有無フラグ
         "b": b,
         "row_ptr": row_ptr,
         "col_ind": col_ind,
@@ -971,24 +990,39 @@ def train_gnn_auto_trainval_pde_weighted(
     total_cells = sum(rc["feats_np"].shape[0] for rc in raw_cases_train + raw_cases_val)
     log_print(f"[INFO] nFeatures = {nFeat}, 総セル数 (全ケース合計) = {total_cells}")
 
+    # --- 教師なし学習モード判定 ---
+    # 全ケースの has_x_true を確認
+    cases_with_x = [rc for rc in (raw_cases_train + raw_cases_val) if rc.get("has_x_true", False)]
+    unsupervised_mode = len(cases_with_x) == 0
+
+    if unsupervised_mode:
+        log_print("[INFO] *** 教師なし学習モード（PINNs）: x_*_rank*.dat が見つかりません ***")
+        log_print("[INFO] *** 損失関数は PDE 損失のみを使用します ***")
+
     # --- グローバル正規化: train+val 全体で統計を取る ---
     all_feats = np.concatenate(
         [rc["feats_np"] for rc in (raw_cases_train + raw_cases_val)], axis=0
-    )
-    all_xtrue = np.concatenate(
-        [rc["x_true_np"] for rc in (raw_cases_train + raw_cases_val)], axis=0
     )
 
     feat_mean = all_feats.mean(axis=0, keepdims=True)
     feat_std  = all_feats.std(axis=0, keepdims=True) + 1e-12
 
-    x_mean = all_xtrue.mean()
-    x_std  = all_xtrue.std() + 1e-12
-
-    log_print(
-        f"[INFO] x_true (all train+val cases): "
-        f"min={all_xtrue.min():.3e}, max={all_xtrue.max():.3e}, mean={x_mean:.3e}"
-    )
+    # x_true の統計（教師あり学習の場合のみ）
+    if not unsupervised_mode:
+        all_xtrue = np.concatenate(
+            [rc["x_true_np"] for rc in cases_with_x], axis=0
+        )
+        x_mean = all_xtrue.mean()
+        x_std  = all_xtrue.std() + 1e-12
+        log_print(
+            f"[INFO] x_true (cases with ground truth): "
+            f"min={all_xtrue.min():.3e}, max={all_xtrue.max():.3e}, mean={x_mean:.3e}"
+        )
+    else:
+        # 教師なし学習の場合、ダミー値を設定
+        x_mean = 0.0
+        x_std  = 1.0
+        log_print("[INFO] x_true 統計: 教師なし学習モードのためダミー値 (mean=0, std=1)")
 
     x_mean_t = torch.tensor(x_mean, dtype=torch.float32, device=device)
     x_std_t  = torch.tensor(x_std,  dtype=torch.float32, device=device)
@@ -1002,12 +1036,16 @@ def train_gnn_auto_trainval_pde_weighted(
     sqsums = np.zeros(num_ranks, dtype=np.float64)
     counts = np.zeros(num_ranks, dtype=np.int64)
 
-    for rc in raw_cases_train:
-        r = int(rc["rank"])
-        x = rc["x_true_np"].astype(np.float64).reshape(-1)
-        sums[r]   += x.sum()
-        sqsums[r] += np.square(x).sum()
-        counts[r] += x.size
+    # 教師あり学習の場合のみ rank ごと統計を計算
+    if not unsupervised_mode:
+        for rc in raw_cases_train:
+            if not rc.get("has_x_true", False):
+                continue
+            r = int(rc["rank"])
+            x = rc["x_true_np"].astype(np.float64).reshape(-1)
+            sums[r]   += x.sum()
+            sqsums[r] += np.square(x).sum()
+            counts[r] += x.size
 
     # 初期値としてグローバル mean/std を入れておき、train に存在する rank だけ上書き
     x_mean_rank = np.full(num_ranks, x_mean, dtype=np.float64)
@@ -1133,6 +1171,7 @@ def train_gnn_auto_trainval_pde_weighted(
         sum_rel_err_tr  = 0.0
         sum_R_pred_tr   = 0.0
         sum_rmse_tr     = 0.0
+        num_cases_with_x = 0  # データ損失を計算したケース数
 
         # -------- train で勾配計算 --------
         for cs in cases_train:
@@ -1144,13 +1183,14 @@ def train_gnn_auto_trainval_pde_weighted(
 
             feats       = cs_gpu["feats"]
             edge_index  = cs_gpu["edge_index"]
-            x_true      = cs_gpu["x_true"]
+            x_true      = cs_gpu["x_true"]  # 教師なし学習の場合は None
             b           = cs_gpu["b"]
             row_ptr     = cs_gpu["row_ptr"]
             col_ind     = cs_gpu["col_ind"]
             vals        = cs_gpu["vals"]
             row_idx     = cs_gpu["row_idx"]
             w_pde       = cs_gpu["w_pde"]
+            has_x_true  = cs_gpu.get("has_x_true", x_true is not None)
 
             # AMP: autocast で順伝播と損失計算を FP16/BF16 で実行
             with torch.cuda.amp.autocast(enabled=use_amp_actual):
@@ -1159,20 +1199,26 @@ def train_gnn_auto_trainval_pde_weighted(
                 # 非正規化スケールに戻す
                 x_pred = x_pred_norm * x_std_t + x_mean_t
 
-                # rank ごとの mean/std を用いた x の正規化（data loss 用）
-                rank_id = int(cs["rank"])
-                mean_r  = x_mean_rank_t[rank_id]
-                std_r   = x_std_rank_t[rank_id]
+                # データ損失: x_true がある場合のみ計算
+                if has_x_true and x_true is not None:
+                    # rank ごとの mean/std を用いた x の正規化（data loss 用）
+                    rank_id = int(cs["rank"])
+                    mean_r  = x_mean_rank_t[rank_id]
+                    std_r   = x_std_rank_t[rank_id]
 
-                # x_true, x_pred を rank ごとに標準化
-                x_true_norm_case = (x_true - mean_r) / (std_r + 1e-12)
-                x_pred_norm_case_for_loss = (x_pred - mean_r) / (std_r + 1e-12)
+                    # x_true, x_pred を rank ごとに標準化
+                    x_true_norm_case = (x_true - mean_r) / (std_r + 1e-12)
+                    x_pred_norm_case_for_loss = (x_pred - mean_r) / (std_r + 1e-12)
 
-                # データ損失: rank ごとに正規化した MSE
-                data_loss_case = F.mse_loss(
-                    x_pred_norm_case_for_loss,
-                    x_true_norm_case
-                )
+                    # データ損失: rank ごとに正規化した MSE
+                    data_loss_case = F.mse_loss(
+                        x_pred_norm_case_for_loss,
+                        x_true_norm_case
+                    )
+                    num_cases_with_x += 1
+                else:
+                    # 教師なし学習: データ損失は 0
+                    data_loss_case = torch.tensor(0.0, device=device)
 
                 # PDE 損失: w_pde 付き相対残差²
                 Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
@@ -1190,15 +1236,15 @@ def train_gnn_auto_trainval_pde_weighted(
             total_pde_loss  = total_pde_loss  + pde_loss_case
 
             with torch.no_grad():
-                # rel_err, RMSE は従来どおり「物理スケール」で計算
-                diff = x_pred - x_true
-                N = x_true.shape[0]
-                rel_err_case = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
-                rmse_case    = torch.sqrt(torch.sum(diff * diff) / N)
-
-                sum_rel_err_tr += rel_err_case.item()
+                # rel_err, RMSE: x_true がある場合のみ計算
+                if has_x_true and x_true is not None:
+                    diff = x_pred - x_true
+                    N = x_true.shape[0]
+                    rel_err_case = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
+                    rmse_case    = torch.sqrt(torch.sum(diff * diff) / N)
+                    sum_rel_err_tr += rel_err_case.item()
+                    sum_rmse_tr    += rmse_case.item()
                 sum_R_pred_tr  += R_pred.detach().item()
-                sum_rmse_tr    += rmse_case.item()
 
             # 遅延ロードの場合、GPU メモリを解放
             if USE_LAZY_LOADING:
@@ -1206,9 +1252,15 @@ def train_gnn_auto_trainval_pde_weighted(
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
-        total_data_loss = total_data_loss / num_train
-        total_pde_loss  = total_pde_loss  / num_train
-        loss = LAMBDA_DATA * total_data_loss + LAMBDA_PDE * total_pde_loss
+        # 損失の計算（教師なし学習の場合は PDE 損失のみ）
+        total_pde_loss = total_pde_loss / num_train
+        if unsupervised_mode or num_cases_with_x == 0:
+            # 教師なし学習: PDE 損失のみ
+            total_data_loss = torch.tensor(0.0, device=device)
+            loss = LAMBDA_PDE * total_pde_loss
+        else:
+            total_data_loss = total_data_loss / num_cases_with_x
+            loss = LAMBDA_DATA * total_data_loss + LAMBDA_PDE * total_pde_loss
 
         # AMP: スケーリングされた勾配で逆伝播
         scaler.scale(loss).backward()
@@ -1226,6 +1278,7 @@ def train_gnn_auto_trainval_pde_weighted(
             sum_rel_err_val = 0.0
             sum_R_pred_val = 0.0
             sum_rmse_val = 0.0
+            num_val_with_x = 0  # x_true があるケース数
             with torch.no_grad():
                 for cs in cases_val:
                     # 遅延ロードの場合、ケースデータを GPU に転送
@@ -1243,15 +1296,21 @@ def train_gnn_auto_trainval_pde_weighted(
                     vals = cs_gpu["vals"]
                     row_idx = cs_gpu["row_idx"]
                     w_pde = cs_gpu["w_pde"]
+                    has_x_true = cs_gpu.get("has_x_true", x_true is not None)
 
                     with torch.cuda.amp.autocast(enabled=use_amp_actual):
                         x_pred_norm = model(feats, edge_index)
                         x_pred = x_pred_norm * x_std_t + x_mean_t
 
-                    diff = x_pred - x_true
-                    rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
-                    N = x_true.shape[0]
-                    rmse = torch.sqrt(torch.sum(diff * diff) / N)
+                    # rel_err, RMSE: x_true がある場合のみ計算
+                    if has_x_true and x_true is not None:
+                        diff = x_pred - x_true
+                        rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
+                        N = x_true.shape[0]
+                        rmse = torch.sqrt(torch.sum(diff * diff) / N)
+                        sum_rel_err_val += rel_err.item()
+                        sum_rmse_val += rmse.item()
+                        num_val_with_x += 1
 
                     Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
                     r = Ax - b
@@ -1262,9 +1321,7 @@ def train_gnn_auto_trainval_pde_weighted(
                     norm_wb = torch.norm(wb) + EPS_RES
                     R_pred = norm_wr / norm_wb
 
-                    sum_rel_err_val += rel_err.item()
                     sum_R_pred_val += R_pred.item()
-                    sum_rmse_val += rmse.item()
 
                     # 遅延ロードの場合、GPU メモリを解放
                     if USE_LAZY_LOADING:
@@ -1272,9 +1329,14 @@ def train_gnn_auto_trainval_pde_weighted(
                         if device.type == "cuda":
                             torch.cuda.empty_cache()
 
-            avg_rel_err_val = sum_rel_err_val / num_val
             avg_R_pred_val = sum_R_pred_val / num_val
-            avg_rmse_val = sum_rmse_val / num_val
+            if num_val_with_x > 0:
+                avg_rel_err_val = sum_rel_err_val / num_val_with_x
+                avg_rmse_val = sum_rmse_val / num_val_with_x
+            else:
+                # 教師なし学習: PDE 残差を指標として使用
+                avg_rel_err_val = avg_R_pred_val
+                avg_rmse_val = 0.0
 
         # 学習率スケジューラを更新（検証誤差があればそれを監視）
         if scheduler is not None:
@@ -1284,9 +1346,14 @@ def train_gnn_auto_trainval_pde_weighted(
 
         # --- ロギング（train + val） ---
         if epoch % PLOT_INTERVAL == 0 or epoch == 1:
-            avg_rel_err_tr = sum_rel_err_tr / num_train
+            # 教師あり学習の場合のみ相対誤差を計算
+            if unsupervised_mode or num_cases_with_x == 0:
+                avg_rel_err_tr = sum_R_pred_tr / num_train  # PDE 残差を代用
+                avg_rmse_tr    = 0.0
+            else:
+                avg_rel_err_tr = sum_rel_err_tr / num_cases_with_x
+                avg_rmse_tr    = sum_rmse_tr / num_cases_with_x
             avg_R_pred_tr  = sum_R_pred_tr / num_train
-            avg_rmse_tr    = sum_rmse_tr / num_train
 
             current_lr = optimizer.param_groups[0]["lr"]
 
@@ -1300,6 +1367,7 @@ def train_gnn_auto_trainval_pde_weighted(
                 sum_rel_err_val = 0.0
                 sum_R_pred_val  = 0.0
                 sum_rmse_val    = 0.0
+                num_val_with_x = 0
                 with torch.no_grad():
                     for cs in cases_val:
                         # 遅延ロードの場合、ケースデータを GPU に転送
@@ -1317,15 +1385,21 @@ def train_gnn_auto_trainval_pde_weighted(
                         vals       = cs_gpu["vals"]
                         row_idx    = cs_gpu["row_idx"]
                         w_pde      = cs_gpu["w_pde"]
+                        has_x_true = cs_gpu.get("has_x_true", x_true is not None)
 
                         with torch.cuda.amp.autocast(enabled=use_amp_actual):
                             x_pred_norm = model(feats, edge_index)
                             x_pred = x_pred_norm * x_std_t + x_mean_t
 
-                        diff = x_pred - x_true
-                        rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
-                        N = x_true.shape[0]
-                        rmse  = torch.sqrt(torch.sum(diff * diff) / N)
+                        # rel_err, RMSE: x_true がある場合のみ計算
+                        if has_x_true and x_true is not None:
+                            diff = x_pred - x_true
+                            rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
+                            N = x_true.shape[0]
+                            rmse  = torch.sqrt(torch.sum(diff * diff) / N)
+                            sum_rel_err_val += rel_err.item()
+                            sum_rmse_val    += rmse.item()
+                            num_val_with_x += 1
 
                         Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
                         r  = Ax - b
@@ -1336,9 +1410,7 @@ def train_gnn_auto_trainval_pde_weighted(
                         norm_wb = torch.norm(wb) + EPS_RES
                         R_pred = norm_wr / norm_wb
 
-                        sum_rel_err_val += rel_err.item()
                         sum_R_pred_val  += R_pred.item()
-                        sum_rmse_val    += rmse.item()
 
                         # 遅延ロードの場合、GPU メモリを解放
                         if USE_LAZY_LOADING:
@@ -1346,9 +1418,14 @@ def train_gnn_auto_trainval_pde_weighted(
                             if device.type == "cuda":
                                 torch.cuda.empty_cache()
 
-                avg_rel_err_val = sum_rel_err_val / num_val
-                avg_R_pred_val  = sum_R_pred_val  / num_val
-                avg_rmse_val    = sum_rmse_val    / num_val
+                avg_R_pred_val = sum_R_pred_val / num_val
+                if num_val_with_x > 0:
+                    avg_rel_err_val = sum_rel_err_val / num_val_with_x
+                    avg_rmse_val    = sum_rmse_val    / num_val_with_x
+                else:
+                    # 教師なし学習: PDE 残差を指標として使用
+                    avg_rel_err_val = avg_R_pred_val
+                    avg_rmse_val    = 0.0
 
             # 履歴に追加
             history["epoch"].append(epoch)
@@ -1440,16 +1517,12 @@ def train_gnn_auto_trainval_pde_weighted(
         vals       = cs_gpu["vals"]
         row_idx    = cs_gpu["row_idx"]
         w_pde      = cs_gpu["w_pde"]
+        has_x_true = cs_gpu.get("has_x_true", x_true is not None)
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=use_amp_actual):
                 x_pred_norm = model(feats, edge_index)
                 x_pred = x_pred_norm * x_std_t + x_mean_t
-            diff = x_pred - x_true
-            N = x_true.shape[0]
-
-            rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
-            rmse    = torch.sqrt(torch.sum(diff * diff) / N)
 
             # 学習で使った weighted PDE 残差
             Ax_pred_w = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
@@ -1471,53 +1544,76 @@ def train_gnn_auto_trainval_pde_weighted(
             R_pred_over_b  = norm_r_pred / (norm_b + EPS_RES)
             R_pred_over_Ax = norm_r_pred / (norm_Ax_pred + EPS_RES)
 
-            # 物理的な（非加重）PDE 残差: OpenFOAM 解
-            Ax_true = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_true)
-            r_true  = Ax_true - b
-            norm_r_true    = torch.norm(r_true)
-            max_abs_r_true = torch.max(torch.abs(r_true))
-            norm_Ax_true   = torch.norm(Ax_true)
-            R_true_over_b  = norm_r_true / (norm_b + EPS_RES)
-            R_true_over_Ax = norm_r_true / (norm_Ax_true + EPS_RES)
+            # 教師あり学習の場合のみ x_true との比較
+            if has_x_true and x_true is not None:
+                diff = x_pred - x_true
+                N = x_true.shape[0]
+                rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
+                rmse    = torch.sqrt(torch.sum(diff * diff) / N)
 
-        log_print(
-            f"  [train] Case (time={time_str}, rank={rank_str}): "
-            f"rel_err = {rel_err.item():.4e}, RMSE = {rmse.item():.4e}, "
-            f"R_pred(weighted) = {R_pred_w.item():.4e}"
-        )
-        log_print(f"    x_true: min={x_true.min().item():.6e}, max={x_true.max().item():.6e}, "
-              f"mean={x_true.mean().item():.6e}, norm={torch.norm(x_true).item():.6e}")
-        log_print(f"    x_pred: min={x_pred.min().item():.6e}, max={x_pred.max().item():.6e}, "
-              f"mean={x_pred.mean().item():.6e}, norm={torch.norm(x_pred).item():.6e}")
-        log_print(f"    x_pred_norm: min={x_pred_norm.min().item():.6e}, "
-              f"max={x_pred_norm.max().item():.6e}, mean={x_pred_norm.mean().item():.6e}")
-        log_print(f"    diff (x_pred - x_true): norm={torch.norm(diff).item():.6e}")
-        log_print(f"    正規化パラメータ: x_mean={x_mean_t.item():.6e}, x_std={x_std_t.item():.6e}")
+                # 物理的な（非加重）PDE 残差: OpenFOAM 解
+                Ax_true = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_true)
+                r_true  = Ax_true - b
+                norm_r_true    = torch.norm(r_true)
+                max_abs_r_true = torch.max(torch.abs(r_true))
+                norm_Ax_true   = torch.norm(Ax_true)
+                R_true_over_b  = norm_r_true / (norm_b + EPS_RES)
+                R_true_over_Ax = norm_r_true / (norm_Ax_true + EPS_RES)
 
-        log_print("    [PDE residual comparison vs OpenFOAM]")
-        log_print(
-            "      GNN : "
-            f"||r||_2={norm_r_pred.item():.6e}, "
-            f"max|r_i|={max_abs_r_pred.item():.6e}, "
-            f"||r||/||b||={R_pred_over_b.item():.5f}, "
-            f"||r||/||Ax||={R_pred_over_Ax.item():.5f}"
-        )
-        log_print(
-            "      OF  : "
-            f"||r||_2={norm_r_true.item():.6e}, "
-            f"max|r_i|={max_abs_r_true.item():.6e}, "
-            f"||r||/||b||={R_true_over_b.item():.5f}, "
-            f"||r||/||Ax||={R_true_over_Ax.item():.5f}"
-        )
+        if has_x_true and x_true is not None:
+            log_print(
+                f"  [train] Case (time={time_str}, rank={rank_str}): "
+                f"rel_err = {rel_err.item():.4e}, RMSE = {rmse.item():.4e}, "
+                f"R_pred(weighted) = {R_pred_w.item():.4e}"
+            )
+            log_print(f"    x_true: min={x_true.min().item():.6e}, max={x_true.max().item():.6e}, "
+                  f"mean={x_true.mean().item():.6e}, norm={torch.norm(x_true).item():.6e}")
+            log_print(f"    x_pred: min={x_pred.min().item():.6e}, max={x_pred.max().item():.6e}, "
+                  f"mean={x_pred.mean().item():.6e}, norm={torch.norm(x_pred).item():.6e}")
+            log_print(f"    x_pred_norm: min={x_pred_norm.min().item():.6e}, "
+                  f"max={x_pred_norm.max().item():.6e}, mean={x_pred_norm.mean().item():.6e}")
+            log_print(f"    diff (x_pred - x_true): norm={torch.norm(diff).item():.6e}")
+            log_print(f"    正規化パラメータ: x_mean={x_mean_t.item():.6e}, x_std={x_std_t.item():.6e}")
 
-        # --- ここでスケール診断 ---
-        a, b, rmse_before, rmse_after = compute_affine_fit(x_true, x_pred)
-        log_print(
-            f"    [Affine fit x_pred->x_true] "
-            f"a={a:.3e}, b={b:.3e}, "
-            f"RMSE_before={rmse_before:.3e}, RMSE_after={rmse_after:.3e}, "
-            f"RMSE_ratio={rmse_after / rmse_before:.3f}"
-        )
+            log_print("    [PDE residual comparison vs OpenFOAM]")
+            log_print(
+                "      GNN : "
+                f"||r||_2={norm_r_pred.item():.6e}, "
+                f"max|r_i|={max_abs_r_pred.item():.6e}, "
+                f"||r||/||b||={R_pred_over_b.item():.5f}, "
+                f"||r||/||Ax||={R_pred_over_Ax.item():.5f}"
+            )
+            log_print(
+                "      OF  : "
+                f"||r||_2={norm_r_true.item():.6e}, "
+                f"max|r_i|={max_abs_r_true.item():.6e}, "
+                f"||r||/||b||={R_true_over_b.item():.5f}, "
+                f"||r||/||Ax||={R_true_over_Ax.item():.5f}"
+            )
+
+            # --- ここでスケール診断 ---
+            a, b_fit, rmse_before, rmse_after = compute_affine_fit(x_true, x_pred)
+            log_print(
+                f"    [Affine fit x_pred->x_true] "
+                f"a={a:.3e}, b={b_fit:.3e}, "
+                f"RMSE_before={rmse_before:.3e}, RMSE_after={rmse_after:.3e}, "
+                f"RMSE_ratio={rmse_after / rmse_before:.3f}"
+            )
+        else:
+            # 教師なし学習: PDE 残差のみ表示
+            log_print(
+                f"  [train] Case (time={time_str}, rank={rank_str}) [教師なし学習]: "
+                f"R_pred(weighted) = {R_pred_w.item():.4e}"
+            )
+            log_print(f"    x_pred: min={x_pred.min().item():.6e}, max={x_pred.max().item():.6e}, "
+                  f"mean={x_pred.mean().item():.6e}, norm={torch.norm(x_pred).item():.6e}")
+            log_print(
+                "    [PDE residual (GNN)]"
+                f" ||r||_2={norm_r_pred.item():.6e}, "
+                f"max|r_i|={max_abs_r_pred.item():.6e}, "
+                f"||r||/||b||={R_pred_over_b.item():.5f}, "
+                f"||r||/||Ax||={R_pred_over_Ax.item():.5f}"
+            )
 
         # 予測結果の書き出し
         x_pred_np = x_pred.cpu().numpy().reshape(-1)
@@ -1527,8 +1623,8 @@ def train_gnn_auto_trainval_pde_weighted(
                 f.write(f"{i} {val:.9e}\n")
         log_print(f"    [INFO] train x_pred を {out_path} に書き出しました。")
 
-        # ★ 誤差場の可視化（train ケース）
-        if enable_error_plots and num_error_plots_train < MAX_ERROR_PLOT_CASES_TRAIN:
+        # ★ 誤差場の可視化（train ケース、x_true がある場合のみ）
+        if enable_error_plots and has_x_true and x_true is not None and num_error_plots_train < MAX_ERROR_PLOT_CASES_TRAIN:
             prefix = f"train_time{time_str}_rank{rank_str}"
             save_error_field_plots(cs, x_pred, x_true, prefix)
             num_error_plots_train += 1
@@ -1564,16 +1660,12 @@ def train_gnn_auto_trainval_pde_weighted(
             vals       = cs_gpu["vals"]
             row_idx    = cs_gpu["row_idx"]
             w_pde      = cs_gpu["w_pde"]
+            has_x_true = cs_gpu.get("has_x_true", x_true is not None)
 
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=use_amp_actual):
                     x_pred_norm = model(feats, edge_index)
                     x_pred = x_pred_norm * x_std_t + x_mean_t
-                diff = x_pred - x_true
-                N = x_true.shape[0]
-
-                rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
-                rmse    = torch.sqrt(torch.sum(diff * diff) / N)
 
                 Ax_pred_w = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
                 r_pred_w  = Ax_pred_w - b
@@ -1593,52 +1685,75 @@ def train_gnn_auto_trainval_pde_weighted(
                 R_pred_over_b  = norm_r_pred / (norm_b + EPS_RES)
                 R_pred_over_Ax = norm_r_pred / (norm_Ax_pred + EPS_RES)
 
-                Ax_true = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_true)
-                r_true  = Ax_true - b
-                norm_r_true    = torch.norm(r_true)
-                max_abs_r_true = torch.max(torch.abs(r_true))
-                norm_Ax_true   = torch.norm(Ax_true)
-                R_true_over_b  = norm_r_true / (norm_b + EPS_RES)
-                R_true_over_Ax = norm_r_true / (norm_Ax_true + EPS_RES)
+                # 教師あり学習の場合のみ x_true との比較
+                if has_x_true and x_true is not None:
+                    diff = x_pred - x_true
+                    N = x_true.shape[0]
+                    rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
+                    rmse    = torch.sqrt(torch.sum(diff * diff) / N)
 
-            log_print(
-                f"  [val]   Case (time={time_str}, rank={rank_str}): "
-                f"rel_err = {rel_err.item():.4e}, RMSE = {rmse.item():.4e}, "
-                f"R_pred(weighted) = {R_pred_w.item():.4e}"
-            )
-            log_print(f"    x_true: min={x_true.min().item():.6e}, max={x_true.max().item():.6e}, "
-                  f"mean={x_true.mean().item():.6e}, norm={torch.norm(x_true).item():.6e}")
-            log_print(f"    x_pred: min={x_pred.min().item():.6e}, max={x_pred.max().item():.6e}, "
-                  f"mean={x_pred.mean().item():.6e}, norm={torch.norm(x_pred).item():.6e}")
-            log_print(f"    x_pred_norm: min={x_pred_norm.min().item():.6e}, "
-                  f"max={x_pred_norm.max().item():.6e}, mean={x_pred_norm.mean().item():.6e}")
-            log_print(f"    diff (x_pred - x_true): norm={torch.norm(diff).item():.6e}")
-            log_print(f"    正規化パラメータ: x_mean={x_mean_t.item():.6e}, x_std={x_std_t.item():.6e}")
+                    Ax_true = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_true)
+                    r_true  = Ax_true - b
+                    norm_r_true    = torch.norm(r_true)
+                    max_abs_r_true = torch.max(torch.abs(r_true))
+                    norm_Ax_true   = torch.norm(Ax_true)
+                    R_true_over_b  = norm_r_true / (norm_b + EPS_RES)
+                    R_true_over_Ax = norm_r_true / (norm_Ax_true + EPS_RES)
 
-            log_print("    [PDE residual comparison vs OpenFOAM]")
-            log_print(
-                "      GNN : "
-                f"||r||_2={norm_r_pred.item():.6e}, "
-                f"max|r_i|={max_abs_r_pred.item():.6e}, "
-                f"||r||/||b||={R_pred_over_b.item():.5f}, "
-                f"||r||/||Ax||={R_pred_over_Ax.item():.5f}"
-            )
-            log_print(
-                "      OF  : "
-                f"||r||_2={norm_r_true.item():.6e}, "
-                f"max|r_i|={max_abs_r_true.item():.6e}, "
-                f"||r||/||b||={R_true_over_b.item():.5f}, "
-                f"||r||/||Ax||={R_true_over_Ax.item():.5f}"
-            )
+            if has_x_true and x_true is not None:
+                log_print(
+                    f"  [val]   Case (time={time_str}, rank={rank_str}): "
+                    f"rel_err = {rel_err.item():.4e}, RMSE = {rmse.item():.4e}, "
+                    f"R_pred(weighted) = {R_pred_w.item():.4e}"
+                )
+                log_print(f"    x_true: min={x_true.min().item():.6e}, max={x_true.max().item():.6e}, "
+                      f"mean={x_true.mean().item():.6e}, norm={torch.norm(x_true).item():.6e}")
+                log_print(f"    x_pred: min={x_pred.min().item():.6e}, max={x_pred.max().item():.6e}, "
+                      f"mean={x_pred.mean().item():.6e}, norm={torch.norm(x_pred).item():.6e}")
+                log_print(f"    x_pred_norm: min={x_pred_norm.min().item():.6e}, "
+                      f"max={x_pred_norm.max().item():.6e}, mean={x_pred_norm.mean().item():.6e}")
+                log_print(f"    diff (x_pred - x_true): norm={torch.norm(diff).item():.6e}")
+                log_print(f"    正規化パラメータ: x_mean={x_mean_t.item():.6e}, x_std={x_std_t.item():.6e}")
 
-            # --- ここでスケール診断 ---
-            a, b, rmse_before, rmse_after = compute_affine_fit(x_true, x_pred)
-            log_print(
-                f"    [Affine fit x_pred->x_true] "
-                f"a={a:.3e}, b={b:.3e}, "
-                f"RMSE_before={rmse_before:.3e}, RMSE_after={rmse_after:.3e}, "
-                f"RMSE_ratio={rmse_after / rmse_before:.3f}"
-            )
+                log_print("    [PDE residual comparison vs OpenFOAM]")
+                log_print(
+                    "      GNN : "
+                    f"||r||_2={norm_r_pred.item():.6e}, "
+                    f"max|r_i|={max_abs_r_pred.item():.6e}, "
+                    f"||r||/||b||={R_pred_over_b.item():.5f}, "
+                    f"||r||/||Ax||={R_pred_over_Ax.item():.5f}"
+                )
+                log_print(
+                    "      OF  : "
+                    f"||r||_2={norm_r_true.item():.6e}, "
+                    f"max|r_i|={max_abs_r_true.item():.6e}, "
+                    f"||r||/||b||={R_true_over_b.item():.5f}, "
+                    f"||r||/||Ax||={R_true_over_Ax.item():.5f}"
+                )
+
+                # --- ここでスケール診断 ---
+                a, b_fit, rmse_before, rmse_after = compute_affine_fit(x_true, x_pred)
+                log_print(
+                    f"    [Affine fit x_pred->x_true] "
+                    f"a={a:.3e}, b={b_fit:.3e}, "
+                    f"RMSE_before={rmse_before:.3e}, RMSE_after={rmse_after:.3e}, "
+                    f"RMSE_ratio={rmse_after / rmse_before:.3f}"
+                )
+            else:
+                # 教師なし学習: PDE 残差のみ表示
+                log_print(
+                    f"  [val]   Case (time={time_str}, rank={rank_str}) [教師なし学習]: "
+                    f"R_pred(weighted) = {R_pred_w.item():.4e}"
+                )
+                log_print(f"    x_pred: min={x_pred.min().item():.6e}, max={x_pred.max().item():.6e}, "
+                      f"mean={x_pred.mean().item():.6e}, norm={torch.norm(x_pred).item():.6e}")
+                log_print(
+                    "    [PDE residual (GNN)]"
+                    f" ||r||_2={norm_r_pred.item():.6e}, "
+                    f"max|r_i|={max_abs_r_pred.item():.6e}, "
+                    f"||r||/||b||={R_pred_over_b.item():.5f}, "
+                    f"||r||/||Ax||={R_pred_over_Ax.item():.5f}"
+                )
 
             x_pred_np = x_pred.cpu().numpy().reshape(-1)
             out_path = os.path.join(OUTPUT_DIR, f"x_pred_val_{time_str}_rank{rank_str}.dat")
@@ -1647,8 +1762,8 @@ def train_gnn_auto_trainval_pde_weighted(
                     f.write(f"{i} {val:.9e}\n")
             log_print(f"    [INFO] val x_pred を {out_path} に書き出しました。")
 
-            # ★ 誤差場の可視化（val ケース）
-            if enable_error_plots and num_error_plots_val < MAX_ERROR_PLOT_CASES_VAL:
+            # ★ 誤差場の可視化（val ケース、x_true がある場合のみ）
+            if enable_error_plots and has_x_true and x_true is not None and num_error_plots_val < MAX_ERROR_PLOT_CASES_VAL:
                 prefix = f"val_time{time_str}_rank{rank_str}"
                 save_error_field_plots(cs, x_pred, x_true, prefix)
                 num_error_plots_val += 1
