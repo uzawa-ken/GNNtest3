@@ -43,6 +43,7 @@ def _set_global_params(
     weight_decay: float,
     lambda_data: float,
     lambda_pde: float,
+    lambda_gauge: float,
     hidden_channels: int,
     num_layers: int,
     num_epochs: int,
@@ -56,6 +57,7 @@ def _set_global_params(
     gnn.WEIGHT_DECAY = weight_decay
     gnn.LAMBDA_DATA = lambda_data
     gnn.LAMBDA_PDE = lambda_pde
+    gnn.LAMBDA_GAUGE = lambda_gauge
     gnn.HIDDEN_CHANNELS = hidden_channels
     gnn.NUM_LAYERS = num_layers
     gnn.NUM_EPOCHS = num_epochs
@@ -123,6 +125,8 @@ def objective(
     train_fraction: float,
     random_seed: int,
     log_file: Path,
+    lambda_gauge: float,
+    search_lambda_gauge: bool,
 ) -> float:
     """Optuna 用の目的関数。"""
 
@@ -134,11 +138,20 @@ def objective(
     hidden_channels = trial.suggest_int("hidden_channels", 32, 256, log=True)
     num_layers = trial.suggest_int("num_layers", 3, 7)
 
+    # ゲージ正則化係数（教師なし学習時の定数モード抑制用）
+    if search_lambda_gauge:
+        lambda_gauge_val = trial.suggest_float(
+            name="lambda_gauge", low=1e-4, high=1.0, log=True
+        )
+    else:
+        lambda_gauge_val = lambda_gauge
+
     _set_global_params(
         lr=lr,
         weight_decay=weight_decay,
         lambda_data=lambda_data,
         lambda_pde=lambda_pde,
+        lambda_gauge=lambda_gauge_val,
         hidden_channels=hidden_channels,
         num_layers=num_layers,
         num_epochs=num_epochs,
@@ -243,6 +256,17 @@ def main() -> None:
         default=".cache",
         help="キャッシュファイルの保存先ディレクトリ（デフォルト: .cache）",
     )
+    parser.add_argument(
+        "--lambda_gauge",
+        type=float,
+        default=0.01,
+        help="ゲージ正則化係数（教師なし学習時の定数モード抑制用、デフォルト: 0.01）",
+    )
+    parser.add_argument(
+        "--search_lambda_gauge",
+        action="store_true",
+        help="ゲージ正則化係数も Optuna で探索する",
+    )
 
     args = parser.parse_args()
 
@@ -270,6 +294,8 @@ def main() -> None:
             args.train_fraction,
             args.random_seed,
             args.log_file,
+            args.lambda_gauge,
+            args.search_lambda_gauge,
         ),
         n_trials=args.trials,
         show_progress_bar=True,

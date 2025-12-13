@@ -163,6 +163,7 @@ CACHE_DIR = ".cache"           # キャッシュファイルの保存先ディ�
 # 損失関数の重み
 LAMBDA_DATA = 0.1              # データ損失の重み
 LAMBDA_PDE  = 0.0001           # PDE 損失の重み
+LAMBDA_GAUGE = 0.01            # ゲージ正則化係数（教師なし学習時）
 ```
 
 ### 3. 実行
@@ -201,7 +202,9 @@ python GNN_train_val_weight.py
     - `--train_fraction`: train/val 分割の割合（デフォルト 0.8）
     - `--random_seed`: Optuna のサンプラーと学習の乱数シード（デフォルト 42）
     - `--log_file`: 試行番号と検証誤差（タブ区切り）を試行ごとに追記するログファイル（デフォルト `optuna_trials_history.tsv`）
-    - （自動探索対象）`lr`, `weight_decay`, `lambda_data`, `lambda_pde`, `hidden_channels`, `num_layers`
+    - `--lambda_gauge`: ゲージ正則化係数（教師なし学習時の定数モード抑制用、デフォルト 0.01）
+    - `--search_lambda_gauge`: ゲージ正則化係数も Optuna で探索する
+    - （自動探索対象）`lr`, `weight_decay`, `lambda_data`, `lambda_pde`, `hidden_channels`, `num_layers`（`--search_lambda_gauge` 指定時は `lambda_gauge` も探索）
 
 3. 実行後、最小の検証誤差と最適パラメータがコンソールに表示されます。また、ログファイルには各試行の番号と検証誤差が時系列で追記されます。
 
@@ -313,6 +316,32 @@ data/
 - 教師なし学習では、学習の収束判定に PDE 残差を使用します
 - 一部のケースのみ `x_*_rank*.dat` がある場合は、そのケースのみでデータ損失を計算します（ハイブリッドモード）
 - 誤差場の可視化は `x_*_rank*.dat` が存在するケースのみで行われます
+
+#### ゲージ正則化（定数モード制御）
+
+圧力ポアソン方程式では、解に任意の定数を加えても PDE を満たすため、教師データなしでは解が一意に定まりません（ゲージ自由度）。この問題を解決するため、教師なし学習モードでは**ゲージ正則化**を自動的に適用します：
+
+$$
+L_\mathrm{gauge} = \left( \frac{1}{N_\mathrm{cells}} \sum_{i=1}^{N_\mathrm{cells}} x_{\mathrm{pred},i} \right)^2
+$$
+
+これにより、予測値の平均がゼロに近づくよう制約され、解の不定性が解消されます。
+
+**総損失（教師なし学習時）**:
+
+$$
+\mathcal{L} = \lambda_\mathrm{pde} \cdot L_\mathrm{pde} + \lambda_\mathrm{gauge} \cdot L_\mathrm{gauge}
+$$
+
+デフォルト値: λ_gauge = 0.01
+
+**評価時のゲージ不変正規化**:
+
+教師データがある場合の評価（相対誤差計算）では、予測値と真値の両方から平均を引いてから比較します。これにより、定数オフセットの違いを無視した公平な評価が可能になります：
+
+$$
+E_\mathrm{rel} = \frac{\| (x_\mathrm{pred} - \bar{x}_\mathrm{pred}) - (x_\mathrm{true} - \bar{x}_\mathrm{true}) \|_2}{\| x_\mathrm{true} - \bar{x}_\mathrm{true} \|_2 + \epsilon}
+$$
 
 ## 検証誤差が頭打ちになるときのチェックリスト
 
