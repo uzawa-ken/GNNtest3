@@ -343,27 +343,75 @@ GraphSAGE ベースの多層ニューラルネットワークを使用してい�
 
 総損失は以下の 2 つの項の重み付き和です：
 
-```
-Loss = LAMBDA_DATA × L_data + LAMBDA_PDE × L_pde
-```
+$$
+\mathcal{L} = \lambda_{\text{data}} \cdot L_{\text{data}} + \lambda_{\text{pde}} \cdot L_{\text{pde}}
+$$
 
-### データ損失（L_data）
+デフォルト値: $\lambda_{\text{data}} = 0.1$, $\lambda_{\text{pde}} = 0.0001$
 
-GNN の予測値と OpenFOAM の解との相対二乗誤差：
+### データ損失（$L_{\text{data}}$）
 
-```
-L_data = ||x_pred - x_true||² / (||x_true||² + ε)
-```
+GNN の予測値と OpenFOAM の解との rank ごとに正規化した平均二乗誤差：
 
-### PDE 損失（L_pde）
+$$
+L_{\text{data}} = \frac{1}{N_{\text{cases}}} \sum_{k=1}^{N_{\text{cases}}} \text{MSE}\left( \tilde{x}^{(k)}_{\text{pred}}, \tilde{x}^{(k)}_{\text{true}} \right)
+$$
 
-メッシュ品質に基づく加重 PDE 残差：
+ここで、$\tilde{x}$ は rank ごとの平均・標準偏差で正規化された値：
 
-```
-L_pde = Σ w_i × |r_i|² / (Σ w_i × |b_i|² + ε)
-```
+$$
+\tilde{x}_i = \frac{x_i - \mu_{\text{rank}}}{\sigma_{\text{rank}} + \epsilon}
+$$
 
-ここで、`w_i` はメッシュ品質から計算される重みで、品質の悪いセルほど大きな重みが付与されます。
+**注意**: 教師なし学習モード（`x_*_rank*.dat` がない場合）では、$L_{\text{data}} = 0$ となり、PDE 損失のみで学習します。
+
+### PDE 損失（$L_{\text{pde}}$）
+
+メッシュ品質に基づく加重 PDE 残差の二乗：
+
+$$
+L_{\text{pde}} = \frac{1}{N_{\text{cases}}} \sum_{k=1}^{N_{\text{cases}}} R^{(k)2}
+$$
+
+ここで、$R^{(k)}$ は各ケースの重み付き相対残差：
+
+$$
+R^{(k)} = \frac{\| \sqrt{w} \odot r \|_2}{\| \sqrt{w} \odot b \|_2 + \epsilon}, \quad r = Ax_{\text{pred}} - b
+$$
+
+- $A$: 係数行列（CSR 形式）
+- $b$: 右辺ベクトル（ソース項）
+- $w$: メッシュ品質に基づく重みベクトル
+- $\odot$: 要素ごとの積（Hadamard 積）
+
+### 検証誤差（Optuna 最適化指標）
+
+Optuna のハイパーパラメータ最適化では、検証データに対する相対誤差の平均を最小化します：
+
+$$
+\text{val\_error} = \frac{1}{N_{\text{val}}} \sum_{k=1}^{N_{\text{val}}} \frac{\| x^{(k)}_{\text{pred}} - x^{(k)}_{\text{true}} \|_2}{\| x^{(k)}_{\text{true}} \|_2 + \epsilon}
+$$
+
+教師なし学習モードでは、検証誤差の代わりに PDE 残差 $R$ を使用します。
+
+### メッシュ品質重み（$w$）
+
+メッシュ品質指標から重み $w_i$ を以下のように計算します：
+
+$$
+w_i = \text{clip}\left(1 + (q_{\text{skew}} - 1) + (q_{\text{nonOrtho}} - 1) + (q_{\text{aspect}} - 1) + (q_{\text{sizeJump}} - 1), \ 1, \ w_{\text{max}}\right)
+$$
+
+各品質指標は基準値で正規化されます：
+
+| 指標 | 基準値 | 計算式 |
+|-----|-------|--------|
+| スキュー | 0.2 | $q_{\text{skew}} = \text{clip}(\text{skew} / 0.2, 0, 5)$ |
+| 非直交性 | 10.0° | $q_{\text{nonOrtho}} = \text{clip}(\text{nonOrtho} / 10, 0, 5)$ |
+| アスペクト比 | 5.0 | $q_{\text{aspect}} = \text{clip}(\text{aspect} / 5, 0, 5)$ |
+| サイズジャンプ | 1.5 | $q_{\text{sizeJump}} = \text{clip}(\text{sizeJump} / 1.5, 0, 5)$ |
+
+品質の悪いセル（スキューが大きい、非直交性が高いなど）では重みが大きくなり、PDE 残差の寄与が増加します。$w_{\text{max}} = 10.0$ で上限をクリップします。
 
 ## 出力ファイル
 
@@ -377,17 +425,6 @@ L_pde = Σ w_i × |r_i|² / (Σ w_i × |b_i|² + ε)
 | `x_pred_val_{time}_rank{N}.dat` | 検証データの予測結果（各 rank ごと） |
 
 ## 技術的詳細
-
-### メッシュ品質重み
-
-メッシュ品質指標から重み `w_pde` を以下のように計算します：
-
-```python
-w_pde = 1.0 + skew_norm + non_ortho_norm + aspect_norm + size_jump_norm
-w_pde = min(w_pde, W_PDE_MAX)  # 上限は 10.0
-```
-
-品質の悪いセル（スキューが大きい、非直交性が高いなど）では重みが大きくなり、PDE 残差の寄与が増加します。
 
 ### CSR 行列演算
 
