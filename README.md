@@ -406,16 +406,10 @@ $$
 
 ### PDE 損失 (L_pde)
 
-メッシュ品質に基づく加重 PDE 残差の二乗：
+メッシュ品質に基づく加重 PDE 残差ノルム：
 
 $$
-L_\mathrm{pde} = \frac{1}{N_\mathrm{cases}} \sum_{k=1}^{N_\mathrm{cases}} R^{(k)2}
-$$
-
-ここで、R^(k) は各ケースの重み付き相対残差：
-
-$$
-R^{(k)} = \frac{\| \sqrt{w} \odot r \|_2}{\| \sqrt{w} \odot b \|_2 + \epsilon}, \quad r = Ax_\mathrm{pred} - b
+L_\mathrm{pde} = \frac{1}{N_\mathrm{cases}} \sum_{k=1}^{N_\mathrm{cases}} \| \sqrt{w} \odot r^{(k)} \|_2, \quad r = Ax_\mathrm{pred} - b
 $$
 
 - A: 係数行列（CSR 形式）
