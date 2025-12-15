@@ -1282,7 +1282,7 @@ def train_gnn_auto_trainval_pde_weighted(
                     # 教師なし学習: データ損失は 0
                     data_loss_case = torch.tensor(0.0, device=device)
 
-                # PDE 損失: w_pde 付き相対残差²
+                # PDE 損失: w_pde 付き残差ノルム ||sqrt(w) * (Ax - b)||_2
                 Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
                 r  = Ax - b
 
@@ -1291,8 +1291,8 @@ def train_gnn_auto_trainval_pde_weighted(
                 wb = sqrt_w * b
                 norm_wr = torch.norm(wr)
                 norm_wb = torch.norm(wb) + EPS_RES
-                R_pred = norm_wr / norm_wb
-                pde_loss_case = R_pred * R_pred
+                R_pred = norm_wr / norm_wb  # 診断用の相対残差（損失には使用しない）
+                pde_loss_case = norm_wr
 
                 # ゲージ損失: x_pred の平均値の二乗（教師なし学習時の定数モード抑制用）
                 # 圧力ポアソン方程式の解は定数の不定性（ゲージ自由度）があるため、
