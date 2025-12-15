@@ -72,6 +72,7 @@ LAMBDA_PDE  = 0.0001
 LAMBDA_GAUGE = 0.01  # ゲージ正則化係数（教師なし学習時の定数モード抑制用）
 
 W_PDE_MAX = 10.0  # w_pde の最大値
+USE_MESH_QUALITY_WEIGHTS = True  # メッシュ品質重みを使用（Falseで全セル等重み w=1）
 
 EPS_DATA = 1e-12  # データ損失用 eps
 EPS_RES  = 1e-12  # 残差正規化用 eps
@@ -551,10 +552,25 @@ def matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x):
 # ------------------------------------------------------------
 
 def build_w_pde_from_feats(feats_np: np.ndarray,
-                           w_pde_max: float = W_PDE_MAX) -> np.ndarray:
+                           w_pde_max: float = W_PDE_MAX,
+                           use_mesh_quality_weights: bool = USE_MESH_QUALITY_WEIGHTS) -> np.ndarray:
     """
     メッシュ品質に基づくPDE損失の重みを計算
+
+    Args:
+        feats_np: 特徴量配列 (N, 13)
+        w_pde_max: 重みの最大値
+        use_mesh_quality_weights: Trueならメッシュ品質重みを計算、Falseなら全セル等重み(w=1)
+
+    Returns:
+        重みベクトル (N,)
     """
+    n_cells = feats_np.shape[0]
+
+    # メッシュ品質重みを使用しない場合は全セル等重み
+    if not use_mesh_quality_weights:
+        return np.ones(n_cells, dtype=np.float32)
+
     # メトリクス抽出
     skew      = feats_np[:, 5]
     non_ortho = feats_np[:, 6]
