@@ -66,22 +66,41 @@ def _set_global_params(
     gnn.RANDOM_SEED = random_seed
 
 
-def _append_trial_result(log_file: Path, trial_number: int, val_error: float) -> None:
-    """試行結果をテキストファイルへ逐次追記する。
-
-    形式: 1 列目に試行番号、2 列目に検証誤差（相対誤差）。
-    ファイルが存在しない場合はヘッダー行を付与する。
-    """
+def _initialize_log_file(log_file: Path) -> None:
+    """ハイパーパラメータ探索ログ用のテキストファイルを作成する。"""
 
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    header = "# trial\tval_error\n"
-    line = f"{trial_number}\t{val_error:.6e}\n"
+    header = (
+        "# trial\tval_error\tlr\tweight_decay\tlambda_data\t"
+        "lambda_pde\thidden_channels\tnum_layers\n"
+    )
 
     if not log_file.exists():
-        log_file.write_text(header + line, encoding="utf-8")
-    else:
-        with log_file.open("a", encoding="utf-8") as f:
-            f.write(line)
+        log_file.write_text(header, encoding="utf-8")
+
+
+def _append_trial_result(
+    log_file: Path,
+    trial_number: int,
+    val_error: float,
+    *,
+    lr: float,
+    weight_decay: float,
+    lambda_data: float,
+    lambda_pde: float,
+    hidden_channels: int,
+    num_layers: int,
+) -> None:
+    """試行結果をテキストファイルへ逐次追記する。"""
+
+    _initialize_log_file(log_file)
+    line = (
+        f"{trial_number}\t{val_error:.6e}\t{lr:.6e}\t{weight_decay:.6e}\t"
+        f"{lambda_data:.6e}\t{lambda_pde:.6e}\t{hidden_channels}\t{num_layers}\n"
+    )
+
+    with log_file.open("a", encoding="utf-8") as f:
+        f.write(line)
 
 
 def _extract_best_val_error(history: dict) -> float:
@@ -155,7 +174,17 @@ def objective(
 
     # 目的関数として最小検証相対誤差を返す
     val_error = _extract_best_val_error(history)
-    _append_trial_result(log_file, trial.number, val_error)
+    _append_trial_result(
+        log_file,
+        trial.number,
+        val_error,
+        lr=lr,
+        weight_decay=weight_decay,
+        lambda_data=lambda_data,
+        lambda_pde=lambda_pde,
+        hidden_channels=hidden_channels,
+        num_layers=num_layers,
+    )
     return val_error
 
 
@@ -251,6 +280,9 @@ def main() -> None:
 
     sampler = optuna.samplers.TPESampler(seed=args.random_seed)
     study = optuna.create_study(direction="minimize", sampler=sampler)
+
+    # ログファイルを探索開始前に準備
+    _initialize_log_file(args.log_file)
 
     # Optuna 探索本体
     study.optimize(

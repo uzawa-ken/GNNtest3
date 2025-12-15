@@ -26,6 +26,16 @@ pip install numpy
 pip install matplotlib
 ```
 
+### 実行時の警告について
+
+PyTorch と Transformers の組み合わせによっては、学習開始時に下記のような警告が出る場合があります。
+
+```
+UserWarning: torch.utils._pytree._register_pytree_node is deprecated. Please use torch.utils._pytree.register_pytree_node instead.
+```
+
+これは Transformers 側が内部的に使用している PyTorch の非推奨 API に対する通知であり、本プロジェクトのコードが原因ではありません。現状は挙動に影響しないため無視しても問題ありませんが、警告を消したい場合は PyTorch/Transformers を最新版へ更新するか、Transformers の修正リリースをお待ちください。
+
 ### 日本語フォント（オプション）
 
 グラフの日本語表示のため、以下のいずれかのフォントをインストールしてください：
@@ -396,16 +406,10 @@ $$
 
 ### PDE 損失 (L_pde)
 
-メッシュ品質に基づく加重 PDE 残差の二乗：
+メッシュ品質に基づく加重 PDE 残差ノルム：
 
 $$
-L_\mathrm{pde} = \frac{1}{N_\mathrm{cases}} \sum_{k=1}^{N_\mathrm{cases}} R^{(k)2}
-$$
-
-ここで、R^(k) は各ケースの重み付き相対残差：
-
-$$
-R^{(k)} = \frac{\| \sqrt{w} \odot r \|_2}{\| \sqrt{w} \odot b \|_2 + \epsilon}, \quad r = Ax_\mathrm{pred} - b
+L_\mathrm{pde} = \frac{1}{N_\mathrm{cases}} \sum_{k=1}^{N_\mathrm{cases}} \| \sqrt{w} \odot r^{(k)} \|_2, \quad r = Ax_\mathrm{pred} - b
 $$
 
 - A: 係数行列（CSR 形式）
