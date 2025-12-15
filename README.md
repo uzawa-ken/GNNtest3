@@ -164,6 +164,9 @@ CACHE_DIR = ".cache"           # キャッシュファイルの保存先ディ�
 LAMBDA_DATA = 0.1              # データ損失の重み
 LAMBDA_PDE  = 0.0001           # PDE 損失の重み
 LAMBDA_GAUGE = 0.01            # ゲージ正則化係数（教師なし学習時）
+
+# メッシュ品質重みオプション
+USE_MESH_QUALITY_WEIGHTS = True  # メッシュ品質重みを使用（Falseで全セル等重み w=1）
 ```
 
 ### 3. 実行
@@ -243,6 +246,9 @@ python hyperparameter_search_optuna.py --no_lazy_loading --trials 20 --data_dir 
 
 # AMP を無効化
 python hyperparameter_search_optuna.py --no_amp --trials 20 --data_dir ./data
+
+# メッシュ品質重みを無効化（全セル等重み w=1）
+python hyperparameter_search_optuna.py --no_mesh_quality_weights --trials 20 --data_dir ./data
 ```
 
 ### 6. データキャッシュ機能

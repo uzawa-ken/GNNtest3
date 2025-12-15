@@ -267,6 +267,11 @@ def main() -> None:
         action="store_true",
         help="ゲージ正則化係数も Optuna で探索する",
     )
+    parser.add_argument(
+        "--no_mesh_quality_weights",
+        action="store_true",
+        help="メッシュ品質重みを無効化（全セル等重み w=1）",
+    )
 
     args = parser.parse_args()
 
@@ -277,6 +282,9 @@ def main() -> None:
     # データキャッシュオプションの設定
     gnn.USE_DATA_CACHE = not args.no_cache
     gnn.CACHE_DIR = args.cache_dir
+
+    # メッシュ品質重みオプションの設定
+    gnn.USE_MESH_QUALITY_WEIGHTS = not args.no_mesh_quality_weights
 
     sampler = optuna.samplers.TPESampler(seed=args.random_seed)
     study = optuna.create_study(direction="minimize", sampler=sampler)
