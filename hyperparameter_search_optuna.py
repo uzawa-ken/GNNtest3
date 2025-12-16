@@ -71,7 +71,7 @@ def _initialize_log_file(log_file: Path) -> None:
 
     log_file.parent.mkdir(parents=True, exist_ok=True)
     header = (
-        "# trial\tval_error\tlr\tweight_decay\tlambda_data\t"
+        "# trial\tval_error\tdata_loss\tpde_loss\tlr\tweight_decay\tlambda_data\t"
         "lambda_pde\thidden_channels\tnum_layers\n"
     )
 
@@ -83,6 +83,8 @@ def _append_trial_result(
     log_file: Path,
     trial_number: int,
     val_error: float,
+    data_loss: float,
+    pde_loss: float,
     *,
     lr: float,
     weight_decay: float,
@@ -95,7 +97,8 @@ def _append_trial_result(
 
     _initialize_log_file(log_file)
     line = (
-        f"{trial_number}\t{val_error:.6e}\t{lr:.6e}\t{weight_decay:.6e}\t"
+        f"{trial_number}\t{val_error:.6e}\t{data_loss:.6e}\t{pde_loss:.6e}\t"
+        f"{lr:.6e}\t{weight_decay:.6e}\t"
         f"{lambda_data:.6e}\t{lambda_pde:.6e}\t{hidden_channels}\t{num_layers}\n"
     )
 
@@ -103,16 +106,37 @@ def _append_trial_result(
         f.write(line)
 
 
-def _extract_best_val_error(history: dict) -> float:
-    """学習履歴から最良の検証相対誤差を取り出す。"""
+def _extract_best_val_error(history: dict) -> tuple:
+    """学習履歴から最良の検証相対誤差とその時点のデータ損失・PDE損失を取り出す。
 
-    val_errors: List[float] = [v for v in history["rel_err_val"] if v is not None]
-    if val_errors:
-        return float(np.min(val_errors))
+    Returns:
+        tuple: (val_error, data_loss, pde_loss)
+    """
 
-    # 検証データが無い場合は訓練誤差を代用
+    val_errors = history["rel_err_val"]
+    data_losses = history["data_loss"]
+    pde_losses = history["pde_loss"]
+
+    # val_error が None でないインデックスを探す
+    valid_indices = [i for i, v in enumerate(val_errors) if v is not None]
+
+    if valid_indices:
+        # 最良の検証誤差を出したエポックを特定
+        best_idx = min(valid_indices, key=lambda i: val_errors[i])
+        return (
+            float(val_errors[best_idx]),
+            float(data_losses[best_idx]),
+            float(pde_losses[best_idx]),
+        )
+
+    # 検証データが無い場合は最終エポックの値を使用
     if history["rel_err_train"]:
-        return float(history["rel_err_train"][-1])
+        last_idx = len(history["rel_err_train"]) - 1
+        return (
+            float(history["rel_err_train"][last_idx]),
+            float(data_losses[last_idx]),
+            float(pde_losses[last_idx]),
+        )
 
     raise RuntimeError("学習履歴が空のため評価指標を取得できませんでした。")
 
@@ -173,11 +197,13 @@ def objective(
     )
 
     # 目的関数として最小検証相対誤差を返す
-    val_error = _extract_best_val_error(history)
+    val_error, data_loss, pde_loss = _extract_best_val_error(history)
     _append_trial_result(
         log_file,
         trial.number,
         val_error,
+        data_loss,
+        pde_loss,
         lr=lr,
         weight_decay=weight_decay,
         lambda_data=lambda_data,
