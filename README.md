@@ -167,6 +167,9 @@ LAMBDA_GAUGE = 0.01            # ゲージ正則化係数（教師なし学習�
 
 # メッシュ品質重みオプション
 USE_MESH_QUALITY_WEIGHTS = True  # メッシュ品質重みを使用（Falseで全セル等重み w=1）
+
+# 対角スケーリングオプション（条件数改善）
+USE_DIAGONAL_SCALING = True      # 対角スケーリングを適用（A_scaled = D^(-1/2) A D^(-1/2)）
 ```
 
 ### 3. 実行
@@ -249,6 +252,9 @@ python hyperparameter_search_optuna.py --no_amp --trials 20 --data_dir ./data
 
 # メッシュ品質重みを無効化（全セル等重み w=1）
 python hyperparameter_search_optuna.py --no_mesh_quality_weights --trials 20 --data_dir ./data
+
+# 対角スケーリングを無効化（条件数改善を行わない）
+python hyperparameter_search_optuna.py --no_diagonal_scaling --trials 20 --data_dir ./data
 ```
 
 ### 6. データキャッシュ機能
@@ -422,6 +428,23 @@ $$
 - b: 右辺ベクトル（ソース項）
 - w: メッシュ品質に基づく重みベクトル
 - ⊙: 要素ごとの積（Hadamard 積）
+
+### 対角スケーリング（条件数改善）
+
+`USE_DIAGONAL_SCALING = True` の場合、係数行列と右辺ベクトルに対角スケーリングを適用して条件数を改善します：
+
+$$
+\tilde{A} = D^{-1/2} A D^{-1/2}, \quad \tilde{b} = D^{-1/2} b, \quad \tilde{x} = D^{1/2} x
+$$
+
+ここで D は A の対角成分からなる対角行列です。これにより：
+
+- スケーリング後の対角成分がすべて 1 に正規化される
+- 行列の条件数が大幅に改善される（典型的には数桁）
+- スパース構造（グラフ構造）は保持される
+- GNN の学習が安定化し、PDE 損失の勾配が適切なスケールになる
+
+学習開始時に、スケーリング前後の条件数推定値がログ出力されます。
 
 ### 検証誤差（Optuna 最適化指標）
 
