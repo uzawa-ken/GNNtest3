@@ -28,6 +28,7 @@ import time
 from datetime import datetime
 import pickle
 import hashlib
+from scipy.sparse import csr_matrix
 # 日本語フォントを指定（インストール済みのものから選ぶ）
 plt.rcParams['font.family'] = 'IPAexGothic'    # or 'Noto Sans CJK JP' など
 # マイナス記号が文字化けする場合の対策
@@ -42,39 +43,6 @@ except ImportError:
     )
 
 EPS = 1.0e-12
-
-def _num_graphs_from_batch(batch: Optional[torch.Tensor]) -> int:
-    if batch is None:
-        return 1
-    return int(batch.max().item()) + 1 if batch.numel() > 0 else 1
-
-def hard_center(
-    x: torch.Tensor,
-    batch: Optional[torch.Tensor] = None,
-    weight: Optional[torch.Tensor] = None,
-    eps: float = EPS,
-) -> torch.Tensor:
-    """
-    ゲージ自由度（定数モード）をハード制約として除去する。
-    - batch があれば各グラフごとに平均0へ投影
-    - weight があれば重み付き平均（例: cell volume, mesh-quality weight 等）
-    """
-    if batch is None:
-        if weight is None:
-            return x - x.mean()
-        wsum = weight.sum().clamp_min(eps)
-        mu = (x * weight).sum() / wsum
-        return x - mu
-
-    num_graphs = _num_graphs_from_batch(batch)
-    if weight is None:
-        w = x.new_ones(x.shape[0])
-    else:
-        w = weight
-    wsum = x.new_zeros(num_graphs).index_add_(0, batch, w)
-    xsum = x.new_zeros(num_graphs).index_add_(0, batch, x * w)
-    mu = xsum / wsum.clamp_min(eps)
-    return x - mu[batch]
 
 # ------------------------------------------------------------
 # 設定
@@ -591,13 +559,10 @@ def matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x):
 # ------------------------------------------------------------
 
 def matvec_csr_numpy(row_ptr, col_ind, vals, x):
-    """NumPy版のCSR行列-ベクトル積"""
+    """NumPy版のCSR行列-ベクトル積（scipy.sparse使用）"""
     n = len(row_ptr) - 1
-    y = np.zeros(n, dtype=np.float64)
-    for i in range(n):
-        start, end = row_ptr[i], row_ptr[i+1]
-        y[i] = np.dot(vals[start:end], x[col_ind[start:end]])
-    return y
+    A = csr_matrix((vals.astype(np.float64), col_ind, row_ptr), shape=(n, n))
+    return A @ x.astype(np.float64)
 
 
 def estimate_condition_number(row_ptr_np, col_ind_np, vals_np, diag_np,
@@ -699,12 +664,9 @@ def apply_diagonal_scaling_csr(row_ptr_np, col_ind_np, vals_np, diag_np, b_np):
     diag_inv_sqrt = (1.0 / diag_sqrt).astype(np.float32)
 
     # 行列値のスケーリング: vals_scaled[k] = vals[k] / sqrt(diag[row]) / sqrt(diag[col])
-    vals_scaled = vals_np.copy()
-    for i in range(n):
-        start, end = row_ptr_np[i], row_ptr_np[i+1]
-        for k in range(start, end):
-            j = col_ind_np[k]
-            vals_scaled[k] = vals_np[k] * diag_inv_sqrt[i] * diag_inv_sqrt[j]
+    # ベクトル化: row_ptr から各非ゼロ要素の行インデックスを復元
+    row_indices = np.repeat(np.arange(n, dtype=np.int64), np.diff(row_ptr_np))
+    vals_scaled = (vals_np * diag_inv_sqrt[row_indices] * diag_inv_sqrt[col_ind_np]).astype(np.float32)
 
     # 右辺ベクトルのスケーリング: b_scaled = D^(-1/2) * b
     b_scaled = b_np * diag_inv_sqrt
@@ -910,6 +872,96 @@ def move_case_to_device(cs, device):
         "aspect_np": cs["aspect_np"],
         "size_jump_np": cs["size_jump_np"],
     }
+
+
+def evaluate_validation_cases(
+    model,
+    cases_val,
+    device,
+    x_std_t,
+    x_mean_t,
+    use_amp_actual,
+):
+    """
+    検証データに対する評価を行う共通関数。
+
+    Returns:
+        tuple: (avg_rel_err_val, avg_rmse_val, avg_R_pred_val, num_val_with_x)
+    """
+    num_val = len(cases_val)
+    if num_val == 0:
+        return None, None, None, 0
+
+    sum_rel_err_val = 0.0
+    sum_R_pred_val = 0.0
+    sum_rmse_val = 0.0
+    num_val_with_x = 0
+
+    with torch.no_grad():
+        for cs in cases_val:
+            # 遅延ロードの場合、ケースデータを GPU に転送
+            if USE_LAZY_LOADING:
+                cs_gpu = move_case_to_device(cs, device)
+            else:
+                cs_gpu = cs
+
+            feats = cs_gpu["feats"]
+            edge_index = cs_gpu["edge_index"]
+            x_true = cs_gpu["x_true"]
+            b = cs_gpu["b"]
+            row_ptr = cs_gpu["row_ptr"]
+            col_ind = cs_gpu["col_ind"]
+            vals = cs_gpu["vals"]
+            row_idx = cs_gpu["row_idx"]
+            w_pde = cs_gpu["w_pde"]
+            has_x_true = cs_gpu.get("has_x_true", x_true is not None)
+            diag_sqrt = cs_gpu.get("diag_sqrt", None)
+            use_dscale = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
+
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp_actual):
+                x_pred_norm = model(feats, edge_index)
+                x_pred = x_pred_norm * x_std_t + x_mean_t
+
+            # rel_err, RMSE: x_true がある場合のみ計算
+            if has_x_true and x_true is not None:
+                # ゲージ不変評価: 両者を平均ゼロに正規化してから比較
+                x_pred_centered = x_pred - torch.mean(x_pred)
+                x_true_centered = x_true - torch.mean(x_true)
+                diff = x_pred_centered - x_true_centered
+                rel_err = torch.norm(diff) / (torch.norm(x_true_centered) + EPS_DATA)
+                N = x_true.shape[0]
+                rmse = torch.sqrt(torch.sum(diff * diff) / N)
+                sum_rel_err_val += rel_err.item()
+                sum_rmse_val += rmse.item()
+                num_val_with_x += 1
+
+            x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
+            Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
+            r = Ax - b
+            sqrt_w = torch.sqrt(w_pde)
+            wr = sqrt_w * r
+            wb = sqrt_w * b
+            norm_wr = torch.norm(wr)
+            norm_wb = torch.norm(wb) + EPS_RES
+            R_pred = norm_wr / norm_wb
+
+            sum_R_pred_val += R_pred.item()
+
+            # 遅延ロードの場合、参照を解放
+            if USE_LAZY_LOADING:
+                del cs_gpu
+
+    avg_R_pred_val = sum_R_pred_val / num_val
+    if num_val_with_x > 0:
+        avg_rel_err_val = sum_rel_err_val / num_val_with_x
+        avg_rmse_val = sum_rmse_val / num_val_with_x
+    else:
+        # 教師なし学習: PDE 残差を指標として使用
+        avg_rel_err_val = avg_R_pred_val
+        avg_rmse_val = 0.0
+
+    return avg_rel_err_val, avg_rmse_val, avg_R_pred_val, num_val_with_x
+
 
 def save_error_field_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
     """
@@ -1445,7 +1497,7 @@ def train_gnn_auto_trainval_pde_weighted(
 
     # --- AMP (混合精度学習) の設定 ---
     use_amp_actual = USE_AMP and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp_actual)
+    scaler = torch.amp.GradScaler(enabled=use_amp_actual)
     if use_amp_actual:
         log_print("[INFO] 混合精度学習 (AMP) が有効です")
     else:
@@ -1504,7 +1556,7 @@ def train_gnn_auto_trainval_pde_weighted(
 
 
             # AMP: autocast で順伝播と損失計算を FP16/BF16 で実行
-            with torch.cuda.amp.autocast(enabled=use_amp_actual):
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp_actual):
                 # モデルは正規化スケールで出力
                 x_pred_norm = model(feats, edge_index)
                 # 非正規化スケールに戻す
@@ -1603,74 +1655,9 @@ def train_gnn_auto_trainval_pde_weighted(
         need_val_eval = num_val > 0 and (scheduler is not None or epoch % PLOT_INTERVAL == 0)
         if need_val_eval:
             model.eval()
-            sum_rel_err_val = 0.0
-            sum_R_pred_val = 0.0
-            sum_rmse_val = 0.0
-            num_val_with_x = 0  # x_true があるケース数
-            with torch.no_grad():
-                for cs in cases_val:
-                    # 遅延ロードの場合、ケースデータを GPU に転送
-                    if USE_LAZY_LOADING:
-                        cs_gpu = move_case_to_device(cs, device)
-                    else:
-                        cs_gpu = cs
-
-                    feats = cs_gpu["feats"]
-                    edge_index = cs_gpu["edge_index"]
-                    x_true = cs_gpu["x_true"]
-                    b = cs_gpu["b"]
-                    row_ptr = cs_gpu["row_ptr"]
-                    col_ind = cs_gpu["col_ind"]
-                    vals = cs_gpu["vals"]
-                    row_idx = cs_gpu["row_idx"]
-                    w_pde = cs_gpu["w_pde"]
-                    has_x_true = cs_gpu.get("has_x_true", x_true is not None)
-                    diag_sqrt  = cs_gpu.get("diag_sqrt", None)
-                    use_dscale = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
-
-                    with torch.cuda.amp.autocast(enabled=use_amp_actual):
-                        x_pred_norm = model(feats, edge_index)
-                        x_pred = x_pred_norm * x_std_t + x_mean_t
-
-                    # rel_err, RMSE: x_true がある場合のみ計算
-                    if has_x_true and x_true is not None:
-                        # ゲージ不変評価: 両者を平均ゼロに正規化してから比較
-                        x_pred_centered = x_pred - torch.mean(x_pred)
-                        x_true_centered = x_true - torch.mean(x_true)
-                        diff = x_pred_centered - x_true_centered
-                        rel_err = torch.norm(diff) / (torch.norm(x_true_centered) + EPS_DATA)
-                        N = x_true.shape[0]
-                        rmse = torch.sqrt(torch.sum(diff * diff) / N)
-                        sum_rel_err_val += rel_err.item()
-                        sum_rmse_val += rmse.item()
-                        num_val_with_x += 1
-
-                    x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
-                    Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
-                    r = Ax - b
-                    sqrt_w = torch.sqrt(w_pde)
-                    wr = sqrt_w * r
-                    wb = sqrt_w * b
-                    norm_wr = torch.norm(wr)
-                    norm_wb = torch.norm(wb) + EPS_RES
-                    R_pred = norm_wr / norm_wb
-
-                    sum_R_pred_val += R_pred.item()
-
-                    # 遅延ロードの場合、GPU メモリを解放
-                    if USE_LAZY_LOADING:
-                        del cs_gpu
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
-
-            avg_R_pred_val = sum_R_pred_val / num_val
-            if num_val_with_x > 0:
-                avg_rel_err_val = sum_rel_err_val / num_val_with_x
-                avg_rmse_val = sum_rmse_val / num_val_with_x
-            else:
-                # 教師なし学習: PDE 残差を指標として使用
-                avg_rel_err_val = avg_R_pred_val
-                avg_rmse_val = 0.0
+            avg_rel_err_val, avg_rmse_val, avg_R_pred_val, _ = evaluate_validation_cases(
+                model, cases_val, device, x_std_t, x_mean_t, use_amp_actual
+            )
 
         # 学習率スケジューラを更新（検証誤差があればそれを監視）
         if scheduler is not None:
@@ -1692,77 +1679,11 @@ def train_gnn_auto_trainval_pde_weighted(
             current_lr = optimizer.param_groups[0]["lr"]
 
             if num_val > 0 and avg_rel_err_val is None:
-                # まだ val を計算していない場合のみ算出（定義は need_val_eval 側と同一にする）
+                # まだ val を計算していない場合のみ算出
                 model.eval()
-                sum_rel_err_val = 0.0
-                sum_R_pred_val  = 0.0
-                sum_rmse_val    = 0.0
-                num_val_with_x = 0
-                with torch.no_grad():
-                    for cs in cases_val:
-                        # 遅延ロードの場合、ケースデータを GPU に転送
-                        if USE_LAZY_LOADING:
-                            cs_gpu = move_case_to_device(cs, device)
-                        else:
-                            cs_gpu = cs
-
-                        feats      = cs_gpu["feats"]
-                        edge_index = cs_gpu["edge_index"]
-                        x_true     = cs_gpu["x_true"]
-                        b          = cs_gpu["b"]
-                        row_ptr    = cs_gpu["row_ptr"]
-                        col_ind    = cs_gpu["col_ind"]
-                        vals       = cs_gpu["vals"]
-                        row_idx    = cs_gpu["row_idx"]
-                        w_pde      = cs_gpu["w_pde"]
-                        has_x_true = cs_gpu.get("has_x_true", x_true is not None)
-
-                        with torch.cuda.amp.autocast(enabled=use_amp_actual):
-                            x_pred_norm = model(feats, edge_index)
-                            x_pred = x_pred_norm * x_std_t + x_mean_t
-
-                        # rel_err, RMSE: x_true がある場合のみ計算
-                        if has_x_true and x_true is not None:
-                            # ゲージ不変評価に統一（train/need_val_eval と同じ）
-                            x_pred_centered = x_pred - torch.mean(x_pred)
-                            x_true_centered = x_true - torch.mean(x_true)
-                            diff = x_pred_centered - x_true_centered
-                            rel_err = torch.norm(diff) / (torch.norm(x_true_centered) + EPS_DATA)
-                            N = x_true.shape[0]
-                            rmse  = torch.sqrt(torch.sum(diff * diff) / N)
-                            sum_rel_err_val += rel_err.item()
-                            sum_rmse_val    += rmse.item()
-                            num_val_with_x += 1
-
-                        diag_sqrt  = cs_gpu.get("diag_sqrt", None)
-                        use_dscale = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
-
-                        x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
-                        Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
-                        r  = Ax - b
-                        sqrt_w = torch.sqrt(w_pde)
-                        wr = sqrt_w * r
-                        wb = sqrt_w * b
-                        norm_wr = torch.norm(wr)
-                        norm_wb = torch.norm(wb) + EPS_RES
-                        R_pred = norm_wr / norm_wb
-
-                        sum_R_pred_val  += R_pred.item()
-
-                        # 遅延ロードの場合、GPU メモリを解放
-                        if USE_LAZY_LOADING:
-                            del cs_gpu
-                            if device.type == "cuda":
-                                torch.cuda.empty_cache()
-
-                avg_R_pred_val = sum_R_pred_val / num_val
-                if num_val_with_x > 0:
-                    avg_rel_err_val = sum_rel_err_val / num_val_with_x
-                    avg_rmse_val    = sum_rmse_val    / num_val_with_x
-                else:
-                    # 教師なし学習: PDE 残差を指標として使用
-                    avg_rel_err_val = avg_R_pred_val
-                    avg_rmse_val    = 0.0
+                avg_rel_err_val, avg_rmse_val, avg_R_pred_val, _ = evaluate_validation_cases(
+                    model, cases_val, device, x_std_t, x_mean_t, use_amp_actual
+                )
 
             # 履歴に追加
             history["epoch"].append(epoch)
@@ -1865,7 +1786,7 @@ def train_gnn_auto_trainval_pde_weighted(
         use_dscale = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=use_amp_actual):
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp_actual):
                 x_pred_norm = model(feats, edge_index)
                 x_pred = x_pred_norm * x_std_t + x_mean_t
 
@@ -2011,13 +1932,17 @@ def train_gnn_auto_trainval_pde_weighted(
             row_idx    = cs_gpu["row_idx"]
             w_pde      = cs_gpu["w_pde"]
             has_x_true = cs_gpu.get("has_x_true", x_true is not None)
+            diag_sqrt  = cs_gpu.get("diag_sqrt", None)
+            use_dscale = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
 
             with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=use_amp_actual):
+                with torch.amp.autocast(device_type='cuda', enabled=use_amp_actual):
                     x_pred_norm = model(feats, edge_index)
                     x_pred = x_pred_norm * x_std_t + x_mean_t
 
-                Ax_pred_w = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+                # 学習で使った weighted PDE 残差（対角スケーリング適用）
+                x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
+                Ax_pred_w = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
                 r_pred_w  = Ax_pred_w - b
                 sqrt_w    = torch.sqrt(w_pde)
                 wr_pred   = sqrt_w * r_pred_w
@@ -2026,12 +1951,15 @@ def train_gnn_auto_trainval_pde_weighted(
                 norm_wb   = torch.norm(wb) + EPS_RES
                 R_pred_w  = norm_wr / norm_wb
 
-                Ax_pred = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
-                r_pred  = Ax_pred - b
+                # 物理的な（非加重）PDE 残差（対角スケール時は r_phys = D^(1/2) r_scaled に戻す）
+                Ax_pred = Ax_pred_w
+                r_scaled = Ax_pred - b
+                r_pred  = (diag_sqrt * r_scaled) if use_dscale else r_scaled
                 norm_r_pred    = torch.norm(r_pred)
                 max_abs_r_pred = torch.max(torch.abs(r_pred))
-                norm_b         = torch.norm(b)
-                norm_Ax_pred   = torch.norm(Ax_pred)
+                b_phys         = (diag_sqrt * b) if use_dscale else b
+                norm_b         = torch.norm(b_phys)
+                norm_Ax_pred   = torch.norm((b_phys + r_pred))
                 R_pred_over_b  = norm_r_pred / (norm_b + EPS_RES)
                 R_pred_over_Ax = norm_r_pred / (norm_Ax_pred + EPS_RES)
 
@@ -2042,11 +1970,14 @@ def train_gnn_auto_trainval_pde_weighted(
                     rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
                     rmse    = torch.sqrt(torch.sum(diff * diff) / N)
 
-                    Ax_true = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_true)
-                    r_true  = Ax_true - b
+                    # 物理的な（非加重）PDE 残差: OpenFOAM 解
+                    x_true_for_pde = (x_true * diag_sqrt) if use_dscale else x_true
+                    Ax_true = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_true_for_pde)
+                    r_scaled_true = Ax_true - b
+                    r_true  = (diag_sqrt * r_scaled_true) if use_dscale else r_scaled_true
                     norm_r_true    = torch.norm(r_true)
                     max_abs_r_true = torch.max(torch.abs(r_true))
-                    norm_Ax_true   = torch.norm(Ax_true)
+                    norm_Ax_true   = torch.norm((b_phys + r_true))
                     R_true_over_b  = norm_r_true / (norm_b + EPS_RES)
                     R_true_over_Ax = norm_r_true / (norm_Ax_true + EPS_RES)
 
