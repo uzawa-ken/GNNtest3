@@ -298,6 +298,11 @@ def main() -> None:
         action="store_true",
         help="メッシュ品質重みを無効化（全セル等重み w=1）",
     )
+    parser.add_argument(
+        "--no_diagonal_scaling",
+        action="store_true",
+        help="対角スケーリングを無効化（条件数改善を行わない）",
+    )
 
     args = parser.parse_args()
 
@@ -311,6 +316,9 @@ def main() -> None:
 
     # メッシュ品質重みオプションの設定
     gnn.USE_MESH_QUALITY_WEIGHTS = not args.no_mesh_quality_weights
+
+    # 対角スケーリングオプションの設定
+    gnn.USE_DIAGONAL_SCALING = not args.no_diagonal_scaling
 
     sampler = optuna.samplers.TPESampler(seed=args.random_seed)
     study = optuna.create_study(direction="minimize", sampler=sampler)

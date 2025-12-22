@@ -73,6 +73,7 @@ LAMBDA_GAUGE = 0.01  # ゲージ正則化係数（教師なし学習時の定数
 
 W_PDE_MAX = 10.0  # w_pde の最大値
 USE_MESH_QUALITY_WEIGHTS = True  # メッシュ品質重みを使用（Falseで全セル等重み w=1）
+USE_DIAGONAL_SCALING = True  # 対角スケーリングを適用（条件数改善のため）
 
 EPS_DATA = 1e-12  # データ損失用 eps
 EPS_RES  = 1e-12  # 残差正規化用 eps
@@ -548,6 +549,132 @@ def matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x):
     return y
 
 # ------------------------------------------------------------
+# 対角スケーリングと条件数推定
+# ------------------------------------------------------------
+
+def matvec_csr_numpy(row_ptr, col_ind, vals, x):
+    """NumPy版のCSR行列-ベクトル積"""
+    n = len(row_ptr) - 1
+    y = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        start, end = row_ptr[i], row_ptr[i+1]
+        y[i] = np.dot(vals[start:end], x[col_ind[start:end]])
+    return y
+
+
+def estimate_condition_number(row_ptr_np, col_ind_np, vals_np, diag_np,
+                               max_iter=50, tol=1e-6):
+    """
+    べき乗法で行列の条件数を推定する。
+
+    Args:
+        row_ptr_np, col_ind_np, vals_np: CSR形式の行列
+        diag_np: 対角成分（逆べき乗法の前処理用）
+        max_iter: 最大反復回数
+        tol: 収束判定の閾値
+
+    Returns:
+        dict: {
+            'lambda_max': 最大固有値（絶対値）,
+            'lambda_min': 最小固有値（絶対値）,
+            'condition_number': 条件数
+        }
+    """
+    n = len(row_ptr_np) - 1
+    eps = 1e-12
+
+    # --- 最大固有値の推定（べき乗法） ---
+    x = np.random.randn(n).astype(np.float64)
+    x = x / (np.linalg.norm(x) + eps)
+
+    lambda_max = 1.0
+    for _ in range(max_iter):
+        y = matvec_csr_numpy(row_ptr_np, col_ind_np, vals_np.astype(np.float64), x)
+        lambda_new = np.dot(x, y)  # Rayleigh quotient
+        y_norm = np.linalg.norm(y) + eps
+        x_new = y / y_norm
+
+        if abs(lambda_new - lambda_max) / (abs(lambda_max) + eps) < tol:
+            lambda_max = abs(lambda_new)
+            break
+        lambda_max = abs(lambda_new)
+        x = x_new
+
+    # --- 最小固有値の推定（逆べき乗法 + 対角前処理） ---
+    # A^(-1) の代わりに D^(-1)A の最小固有値を推定（計算効率のため）
+    x = np.random.randn(n).astype(np.float64)
+    x = x / (np.linalg.norm(x) + eps)
+
+    diag_inv = 1.0 / (np.abs(diag_np).astype(np.float64) + eps)
+
+    lambda_min = 1.0
+    for iteration in range(max_iter):
+        # y = D^(-1) * A * x
+        Ax = matvec_csr_numpy(row_ptr_np, col_ind_np, vals_np.astype(np.float64), x)
+        y = diag_inv * Ax
+
+        lambda_new = np.dot(x, y)  # Rayleigh quotient
+        y_norm = np.linalg.norm(y) + eps
+        x_new = y / y_norm
+
+        if abs(lambda_new - lambda_min) / (abs(lambda_min) + eps) < tol:
+            lambda_min = abs(lambda_new)
+            break
+        lambda_min = abs(lambda_new)
+        x = x_new
+
+    # 対角前処理した行列の条件数から元の条件数を推定
+    # 簡易的に、D^(-1)A の固有値範囲を使用
+    condition_number = lambda_max / (lambda_min + eps)
+
+    return {
+        'lambda_max': lambda_max,
+        'lambda_min': lambda_min * np.mean(np.abs(diag_np)),  # 元のスケールに戻す近似
+        'condition_number': condition_number,
+    }
+
+
+def apply_diagonal_scaling_csr(row_ptr_np, col_ind_np, vals_np, diag_np, b_np):
+    """
+    対角スケーリングを CSR 行列と右辺ベクトルに適用する。
+
+    A_scaled = D^(-1/2) * A * D^(-1/2)
+    b_scaled = D^(-1/2) * b
+
+    Args:
+        row_ptr_np, col_ind_np, vals_np: CSR形式の行列
+        diag_np: 対角成分
+        b_np: 右辺ベクトル
+
+    Returns:
+        tuple: (vals_scaled_np, b_scaled_np, diag_sqrt_np)
+            - vals_scaled_np: スケーリング後の行列値
+            - b_scaled_np: スケーリング後の右辺ベクトル
+            - diag_sqrt_np: sqrt(|diag|)（逆変換用）
+    """
+    eps = 1e-12
+    n = len(diag_np)
+
+    # sqrt(|diag|) を計算
+    diag_abs = np.abs(diag_np).astype(np.float64)
+    diag_sqrt = np.sqrt(diag_abs + eps).astype(np.float32)
+    diag_inv_sqrt = (1.0 / diag_sqrt).astype(np.float32)
+
+    # 行列値のスケーリング: vals_scaled[k] = vals[k] / sqrt(diag[row]) / sqrt(diag[col])
+    vals_scaled = vals_np.copy()
+    for i in range(n):
+        start, end = row_ptr_np[i], row_ptr_np[i+1]
+        for k in range(start, end):
+            j = col_ind_np[k]
+            vals_scaled[k] = vals_np[k] * diag_inv_sqrt[i] * diag_inv_sqrt[j]
+
+    # 右辺ベクトルのスケーリング: b_scaled = D^(-1/2) * b
+    b_scaled = b_np * diag_inv_sqrt
+
+    return vals_scaled, b_scaled, diag_sqrt
+
+
+# ------------------------------------------------------------
 # メッシュ品質 w_pde
 # ------------------------------------------------------------
 
@@ -607,7 +734,8 @@ def build_w_pde_from_feats(feats_np: np.ndarray,
 # raw_case → torch case への変換ヘルパ
 # ------------------------------------------------------------
 
-def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, device, lazy_load=False):
+def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, device, lazy_load=False,
+                                    use_diagonal_scaling=USE_DIAGONAL_SCALING):
     """
     raw_case を torch テンソルに変換する。
 
@@ -616,10 +744,30 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
     lazy_load : bool
         True の場合、データを CPU 上に保持し、GPU への転送は行わない。
         学習時に move_case_to_device() で必要なときだけ GPU に転送する。
+    use_diagonal_scaling : bool
+        True の場合、対角スケーリングを適用して条件数を改善する。
+        A_scaled = D^(-1/2) * A * D^(-1/2), b_scaled = D^(-1/2) * b
     """
     feats_np  = rc["feats_np"]
     x_true_np = rc["x_true_np"]
     has_x_true = rc.get("has_x_true", x_true_np is not None)
+
+    # 対角成分を取得（feats_np[:, 3] が対角成分）
+    diag_np = feats_np[:, 3].copy()
+
+    # 対角スケーリングの適用
+    vals_np = rc["vals_np"]
+    b_np = rc["b_np"]
+    diag_sqrt_np = None
+
+    if use_diagonal_scaling:
+        vals_np, b_np, diag_sqrt_np = apply_diagonal_scaling_csr(
+            rc["row_ptr_np"], rc["col_ind_np"], rc["vals_np"], diag_np, rc["b_np"]
+        )
+        # x_true もスケーリング: x_scaled = D^(1/2) * x
+        # (逆変換時に D^(-1/2) を掛けて元に戻す)
+        if has_x_true and x_true_np is not None:
+            x_true_np = x_true_np * diag_sqrt_np
 
     feats_norm = (feats_np - feat_mean) / feat_std
 
@@ -646,13 +794,19 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
         x_true      = None
         x_true_norm = None
 
-    b       = torch.from_numpy(rc["b_np"]).float().to(target_device)
+    b       = torch.from_numpy(b_np).float().to(target_device)
     row_ptr = torch.from_numpy(rc["row_ptr_np"]).long().to(target_device)
     col_ind = torch.from_numpy(rc["col_ind_np"]).long().to(target_device)
-    vals    = torch.from_numpy(rc["vals_np"]).float().to(target_device)
+    vals    = torch.from_numpy(vals_np).float().to(target_device)
     row_idx = torch.from_numpy(rc["row_idx_np"]).long().to(target_device)
 
     w_pde = torch.from_numpy(w_pde_np).float().to(target_device)
+
+    # 対角スケーリング用の係数（逆変換用）
+    if diag_sqrt_np is not None:
+        diag_sqrt = torch.from_numpy(diag_sqrt_np).float().to(target_device)
+    else:
+        diag_sqrt = None
 
     return {
         "time": rc["time"],
@@ -670,6 +824,9 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
         "row_idx": row_idx,
         "w_pde": w_pde,
         "w_pde_np": w_pde_np,  # ★ 分布ログ用に numpy を保持しておく
+        "diag_sqrt": diag_sqrt,  # ★ 対角スケーリングの逆変換用
+        "diag_sqrt_np": diag_sqrt_np,  # ★ NumPy版も保持
+        "use_diagonal_scaling": use_diagonal_scaling,  # スケーリング適用フラグ
 
         # ★ 誤差場可視化用に元の座標・品質指標も持たせる
         "coords_np": feats_np[:, 0:3].copy(),   # [x, y, z]
@@ -689,6 +846,7 @@ def move_case_to_device(cs, device):
     x_true = cs["x_true"]
     x_true_norm = cs["x_true_norm"]
     has_x_true = cs.get("has_x_true", x_true is not None)
+    diag_sqrt = cs.get("diag_sqrt")
 
     return {
         "time": cs["time"],
@@ -706,6 +864,9 @@ def move_case_to_device(cs, device):
         "row_idx": cs["row_idx"].to(device, non_blocking=True),
         "w_pde": cs["w_pde"].to(device, non_blocking=True),
         "w_pde_np": cs["w_pde_np"],
+        "diag_sqrt": diag_sqrt.to(device, non_blocking=True) if diag_sqrt is not None else None,
+        "diag_sqrt_np": cs.get("diag_sqrt_np"),
+        "use_diagonal_scaling": cs.get("use_diagonal_scaling", False),
         "coords_np": cs["coords_np"],
         "skew_np": cs["skew_np"],
         "non_ortho_np": cs["non_ortho_np"],
@@ -1190,6 +1351,41 @@ def train_gnn_auto_trainval_pde_weighted(
         log_print(f"  p50   = {p50:.3e}")
         log_print(f"  p90   = {p90:.3e}")
         log_print(f"  p99   = {p99:.3e}")
+        log_print("==========================================================================")
+
+    # --- 条件数の推定（最初のケースで計算） ---
+    if raw_cases_train:
+        rc0 = raw_cases_train[0]
+        diag_np = rc0["feats_np"][:, 3]  # 対角成分
+
+        log_print("=== Condition number estimation (first training case) ===")
+
+        # スケーリング前の条件数
+        cond_before = estimate_condition_number(
+            rc0["row_ptr_np"], rc0["col_ind_np"], rc0["vals_np"], diag_np
+        )
+        log_print(f"  [Before scaling] λ_max = {cond_before['lambda_max']:.6e}, "
+                  f"λ_min = {cond_before['lambda_min']:.6e}, "
+                  f"κ(A) = {cond_before['condition_number']:.6e}")
+
+        # スケーリング後の条件数
+        if USE_DIAGONAL_SCALING:
+            vals_scaled, _, _ = apply_diagonal_scaling_csr(
+                rc0["row_ptr_np"], rc0["col_ind_np"], rc0["vals_np"], diag_np, rc0["b_np"]
+            )
+            # スケーリング後は対角成分が1になる
+            diag_scaled = np.ones_like(diag_np)
+            cond_after = estimate_condition_number(
+                rc0["row_ptr_np"], rc0["col_ind_np"], vals_scaled, diag_scaled
+            )
+            log_print(f"  [After scaling]  λ_max = {cond_after['lambda_max']:.6e}, "
+                      f"λ_min = {cond_after['lambda_min']:.6e}, "
+                      f"κ(Ã) = {cond_after['condition_number']:.6e}")
+            improvement = cond_before['condition_number'] / (cond_after['condition_number'] + 1e-12)
+            log_print(f"  Condition number improvement: {improvement:.2f}x")
+        else:
+            log_print("  [Diagonal scaling disabled]")
+
         log_print("==========================================================================")
 
     num_train = len(cases_train)
