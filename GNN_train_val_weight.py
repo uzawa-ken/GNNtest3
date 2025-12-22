@@ -9,6 +9,7 @@ train_gnn_auto_trainval_pde_weighted.py
 - 複数プロセス（rank）のデータを統合して学習。
 - その (time, rank) リストを train/val に分割して学習。
 - 損失は data loss (相対二乗誤差) + mesh-quality-weighted PDE loss。
+- 追加: pressure のゲージ自由度（定数モード）を hard constraint として除去（centered投影）。
 - 学習中に、loss / data_loss / PDE_loss / rel_err_train / rel_err_val を
   リアルタイムにポップアップ表示。
 
@@ -21,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from typing import Optional
 from mpl_toolkits.mplot3d import Axes3D  # 3Dプロット用（projection="3d"で内部的に使用）
 import time
 from datetime import datetime
@@ -38,6 +40,41 @@ except ImportError:
         "torch_geometric がインストールされていません。"
         "pip install torch-geometric などでインストールしてください。"
     )
+
+EPS = 1.0e-12
+
+def _num_graphs_from_batch(batch: Optional[torch.Tensor]) -> int:
+    if batch is None:
+        return 1
+    return int(batch.max().item()) + 1 if batch.numel() > 0 else 1
+
+def hard_center(
+    x: torch.Tensor,
+    batch: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    eps: float = EPS,
+) -> torch.Tensor:
+    """
+    ゲージ自由度（定数モード）をハード制約として除去する。
+    - batch があれば各グラフごとに平均0へ投影
+    - weight があれば重み付き平均（例: cell volume, mesh-quality weight 等）
+    """
+    if batch is None:
+        if weight is None:
+            return x - x.mean()
+        wsum = weight.sum().clamp_min(eps)
+        mu = (x * weight).sum() / wsum
+        return x - mu
+
+    num_graphs = _num_graphs_from_batch(batch)
+    if weight is None:
+        w = x.new_ones(x.shape[0])
+    else:
+        w = weight
+    wsum = x.new_zeros(num_graphs).index_add_(0, batch, w)
+    xsum = x.new_zeros(num_graphs).index_add_(0, batch, x * w)
+    mu = xsum / wsum.clamp_min(eps)
+    return x - mu[batch]
 
 # ------------------------------------------------------------
 # 設定
@@ -544,7 +581,8 @@ def matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x):
     if x.dtype != vals.dtype:
         x = x.to(vals.dtype)
 
-    y = torch.zeros_like(x)
+    n_rows = int(row_ptr.numel() - 1)
+    y = torch.zeros(n_rows, device=x.device, dtype=x.dtype)
     y.index_add_(0, row_idx, vals * x[col_ind])
     return y
 
@@ -755,7 +793,7 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
     # 対角成分を取得（feats_np[:, 3] が対角成分）
     diag_np = feats_np[:, 3].copy()
 
-    # 対角スケーリングの適用
+    # 対角スケーリングの適用（A,bのみをスケール。xは物理スケールのまま保持）
     vals_np = rc["vals_np"]
     b_np = rc["b_np"]
     diag_sqrt_np = None
@@ -764,10 +802,9 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
         vals_np, b_np, diag_sqrt_np = apply_diagonal_scaling_csr(
             rc["row_ptr_np"], rc["col_ind_np"], rc["vals_np"], diag_np, rc["b_np"]
         )
-        # x_true もスケーリング: x_scaled = D^(1/2) * x
-        # (逆変換時に D^(-1/2) を掛けて元に戻す)
-        if has_x_true and x_true_np is not None:
-            x_true_np = x_true_np * diag_sqrt_np
+        # NOTE:
+        # ここでは x_true / x_pred は「物理スケール」のまま保持する。
+        # PDE側だけ x_scaled = D^(1/2) x を用いて A_scaled x_scaled = b_scaled を評価する。
 
     feats_norm = (feats_np - feat_mean) / feat_std
 
@@ -1006,10 +1043,6 @@ def save_error_field_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
 # ------------------------------------------------------------
 # 可視化ユーティリティ
 # ------------------------------------------------------------
-
-EPS_PLOT = 1e-12  # まだ無ければ定数として追加
-
-EPS_PLOT = 1e-12  # ログプロット用の下限値
 
 def init_plot():
     plt.ion()
@@ -1390,6 +1423,7 @@ def train_gnn_auto_trainval_pde_weighted(
 
     num_train = len(cases_train)
     num_val   = len(cases_val)
+    num_train_with_x = sum(1 for cs in cases_train if cs.get("has_x_true", False))
 
     # --- モデル定義 ---
     model = SimpleSAGE(
@@ -1437,11 +1471,11 @@ def train_gnn_auto_trainval_pde_weighted(
     # --- 学習ループ ---
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         total_data_loss = 0.0
         total_pde_loss  = 0.0
-        total_gauge_loss = 0.0  # ゲージ損失（教師なし学習時の定数モード抑制用）
+        total_gauge_loss = 0.0
         sum_rel_err_tr  = 0.0
         sum_R_pred_tr   = 0.0
         sum_rmse_tr     = 0.0
@@ -1465,6 +1499,9 @@ def train_gnn_auto_trainval_pde_weighted(
             row_idx     = cs_gpu["row_idx"]
             w_pde       = cs_gpu["w_pde"]
             has_x_true  = cs_gpu.get("has_x_true", x_true is not None)
+            diag_sqrt   = cs_gpu.get("diag_sqrt", None)
+            use_dscale  = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
+
 
             # AMP: autocast で順伝播と損失計算を FP16/BF16 で実行
             with torch.cuda.amp.autocast(enabled=use_amp_actual):
@@ -1492,10 +1529,12 @@ def train_gnn_auto_trainval_pde_weighted(
                     num_cases_with_x += 1
                 else:
                     # 教師なし学習: データ損失は 0
-                    data_loss_case = torch.tensor(0.0, device=device)
+                    data_loss_case = None
 
                 # PDE 損失: w_pde 付き残差ノルム ||sqrt(w) * (Ax - b)||_2
-                Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+                # 対角スケーリング有効時は、A_scaled x_scaled = b_scaled を評価
+                x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
+                Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
                 r  = Ax - b
 
                 sqrt_w = torch.sqrt(w_pde)
@@ -1504,16 +1543,25 @@ def train_gnn_auto_trainval_pde_weighted(
                 norm_wr = torch.norm(wr)
                 norm_wb = torch.norm(wb) + EPS_RES
                 R_pred = norm_wr / norm_wb  # 診断用の相対残差（損失には使用しない）
-                pde_loss_case = norm_wr
-
+                pde_loss_case = R_pred * R_pred
                 # ゲージ損失: x_pred の平均値の二乗（教師なし学習時の定数モード抑制用）
                 # 圧力ポアソン方程式の解は定数の不定性（ゲージ自由度）があるため、
                 # 平均ゼロに近づけることで解を一意に定める
+                # ゲージ正則化は「物理スケール x」の定数モード抑制として維持
                 gauge_loss_case = torch.mean(x_pred) ** 2
 
-            total_data_loss = total_data_loss + data_loss_case
-            total_pde_loss  = total_pde_loss  + pde_loss_case
-            total_gauge_loss = total_gauge_loss + gauge_loss_case
+            # ---- 目的関数（平均化を保ったまま、ケースごとに backward して勾配蓄積）----
+            loss_case = (LAMBDA_PDE / num_train) * pde_loss_case + (LAMBDA_GAUGE / num_train) * gauge_loss_case
+            if (not unsupervised_mode) and (num_train_with_x > 0) and (data_loss_case is not None):
+                loss_case = loss_case + (LAMBDA_DATA / num_train_with_x) * data_loss_case
+
+            scaler.scale(loss_case).backward()
+
+            # logging用（グラフを持たない形で集計）
+            total_pde_loss += float(pde_loss_case.detach().cpu())
+            total_gauge_loss += float(gauge_loss_case.detach().cpu())
+            if data_loss_case is not None:
+                total_data_loss += float(data_loss_case.detach().cpu())
 
             with torch.no_grad():
                 # rel_err, RMSE: x_true がある場合のみ計算
@@ -1531,30 +1579,22 @@ def train_gnn_auto_trainval_pde_weighted(
                     sum_rmse_tr    += rmse_case.item()
                 sum_R_pred_tr  += R_pred.detach().item()
 
-            # 遅延ロードの場合、GPU メモリを解放
+            # 遅延ロードの場合、参照を外す（empty_cache は通常不要・逆に遅くなる）
             if USE_LAZY_LOADING:
                 del cs_gpu
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
 
-        # 損失の計算（教師なし学習の場合は PDE 損失 + ゲージ損失）
-        total_pde_loss = total_pde_loss / num_train
-        total_gauge_loss = total_gauge_loss / num_train
-        if unsupervised_mode or num_cases_with_x == 0:
-            # 教師なし学習: PDE 損失 + ゲージ正則化
-            # ゲージ正則化は圧力ポアソンの定数モード（ゲージ自由度）を抑制
-            total_data_loss = torch.tensor(0.0, device=device)
-            loss = LAMBDA_PDE * total_pde_loss + LAMBDA_GAUGE * total_gauge_loss
-        else:
-            # 教師あり学習: データ損失 + PDE 損失（ゲージ正則化は不要、x_true が定数モードを固定）
-            total_data_loss = total_data_loss / num_cases_with_x
-            loss = LAMBDA_DATA * total_data_loss + LAMBDA_PDE * total_pde_loss
-
-        # AMP: スケーリングされた勾配で逆伝播
-        scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
+        # epoch平均（ログ・history用）
+        avg_pde_loss = total_pde_loss / max(1, num_train)
+        avg_gauge_loss = total_gauge_loss / max(1, num_train)
+        if unsupervised_mode or num_cases_with_x == 0:
+            avg_data_loss = 0.0
+            loss_value = (LAMBDA_PDE * avg_pde_loss) + (LAMBDA_GAUGE * avg_gauge_loss)
+        else:
+            avg_data_loss = total_data_loss / max(1, num_cases_with_x)
+            loss_value = (LAMBDA_DATA * avg_data_loss) + (LAMBDA_PDE * avg_pde_loss) + (LAMBDA_GAUGE * avg_gauge_loss)
         avg_rel_err_val = None
         avg_R_pred_val = None
         avg_rmse_val = None
@@ -1585,6 +1625,8 @@ def train_gnn_auto_trainval_pde_weighted(
                     row_idx = cs_gpu["row_idx"]
                     w_pde = cs_gpu["w_pde"]
                     has_x_true = cs_gpu.get("has_x_true", x_true is not None)
+                    diag_sqrt  = cs_gpu.get("diag_sqrt", None)
+                    use_dscale = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
 
                     with torch.cuda.amp.autocast(enabled=use_amp_actual):
                         x_pred_norm = model(feats, edge_index)
@@ -1603,7 +1645,8 @@ def train_gnn_auto_trainval_pde_weighted(
                         sum_rmse_val += rmse.item()
                         num_val_with_x += 1
 
-                    Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+                    x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
+                    Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
                     r = Ax - b
                     sqrt_w = torch.sqrt(w_pde)
                     wr = sqrt_w * r
@@ -1631,7 +1674,7 @@ def train_gnn_auto_trainval_pde_weighted(
 
         # 学習率スケジューラを更新（検証誤差があればそれを監視）
         if scheduler is not None:
-            metric_for_scheduler = avg_rel_err_val if avg_rel_err_val is not None else loss.item()
+            metric_for_scheduler = avg_rel_err_val if avg_rel_err_val is not None else float(loss_value)
             scheduler.step(metric_for_scheduler)
 
 
@@ -1648,12 +1691,8 @@ def train_gnn_auto_trainval_pde_weighted(
 
             current_lr = optimizer.param_groups[0]["lr"]
 
-            avg_rel_err_val = None
-            avg_R_pred_val  = None
-            avg_rmse_val    = None
-
             if num_val > 0 and avg_rel_err_val is None:
-                # スケジューラを使っていない場合などで、まだ val を計算していないときのみ算出
+                # まだ val を計算していない場合のみ算出（定義は need_val_eval 側と同一にする）
                 model.eval()
                 sum_rel_err_val = 0.0
                 sum_R_pred_val  = 0.0
@@ -1684,15 +1723,22 @@ def train_gnn_auto_trainval_pde_weighted(
 
                         # rel_err, RMSE: x_true がある場合のみ計算
                         if has_x_true and x_true is not None:
-                            diff = x_pred - x_true
-                            rel_err = torch.norm(diff) / (torch.norm(x_true) + EPS_DATA)
+                            # ゲージ不変評価に統一（train/need_val_eval と同じ）
+                            x_pred_centered = x_pred - torch.mean(x_pred)
+                            x_true_centered = x_true - torch.mean(x_true)
+                            diff = x_pred_centered - x_true_centered
+                            rel_err = torch.norm(diff) / (torch.norm(x_true_centered) + EPS_DATA)
                             N = x_true.shape[0]
                             rmse  = torch.sqrt(torch.sum(diff * diff) / N)
                             sum_rel_err_val += rel_err.item()
                             sum_rmse_val    += rmse.item()
                             num_val_with_x += 1
 
-                        Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+                        diag_sqrt  = cs_gpu.get("diag_sqrt", None)
+                        use_dscale = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
+
+                        x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
+                        Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
                         r  = Ax - b
                         sqrt_w = torch.sqrt(w_pde)
                         wr = sqrt_w * r
@@ -1720,12 +1766,12 @@ def train_gnn_auto_trainval_pde_weighted(
 
             # 履歴に追加
             history["epoch"].append(epoch)
-            history["loss"].append(loss.item())
-            history["data_loss"].append((LAMBDA_DATA * total_data_loss).item())
-            history["pde_loss"].append((LAMBDA_PDE * total_pde_loss).item())
-            history["gauge_loss"].append((LAMBDA_GAUGE * total_gauge_loss).item())
-            history["rel_err_train"].append(avg_rel_err_tr)
-            history["rel_err_val"].append(avg_rel_err_val)  # None の可能性あり
+            history["loss"].append(float(loss_value))
+            history["data_loss"].append(float(LAMBDA_DATA * avg_data_loss))
+            history["pde_loss"].append(float(LAMBDA_PDE * avg_pde_loss))
+            history["gauge_loss"].append(float(LAMBDA_GAUGE * avg_gauge_loss))
+            history["rel_err_train"].append(float(avg_rel_err_tr))
+            history["rel_err_val"].append(None if avg_rel_err_val is None else float(avg_rel_err_val))
 
             # プロット更新
             if enable_plot:
@@ -1733,14 +1779,14 @@ def train_gnn_auto_trainval_pde_weighted(
 
             # コンソールログ
             log = (
-                f"[Epoch {epoch:5d}] loss={loss.item():.4e}, "
+                f"[Epoch {epoch:5d}] loss={loss_value:.4e}, "
                 f"lr={current_lr:.3e}, "
-                f"data_loss={LAMBDA_DATA * total_data_loss:.4e}, "
-                f"PDE_loss={LAMBDA_PDE * total_pde_loss:.4e}, "
+                f"data_loss={LAMBDA_DATA * avg_data_loss:.4e}, "
+                f"PDE_loss={LAMBDA_PDE * avg_pde_loss:.4e}, "
             )
             if unsupervised_mode or num_cases_with_x == 0:
                 # 教師なし学習: ゲージ損失も表示
-                log += f"gauge_loss={LAMBDA_GAUGE * total_gauge_loss:.4e}, "
+                log += f"gauge_loss={LAMBDA_GAUGE * avg_gauge_loss:.4e}, "
             log += (
                 f"rel_err_train(avg)={avg_rel_err_tr:.4e}, "
 #                f"RMSE_train(avg)={avg_rmse_tr:.4e}, "
@@ -1815,6 +1861,8 @@ def train_gnn_auto_trainval_pde_weighted(
         row_idx    = cs_gpu["row_idx"]
         w_pde      = cs_gpu["w_pde"]
         has_x_true = cs_gpu.get("has_x_true", x_true is not None)
+        diag_sqrt  = cs_gpu.get("diag_sqrt", None)
+        use_dscale = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=use_amp_actual):
@@ -1822,7 +1870,8 @@ def train_gnn_auto_trainval_pde_weighted(
                 x_pred = x_pred_norm * x_std_t + x_mean_t
 
             # 学習で使った weighted PDE 残差
-            Ax_pred_w = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
+            x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
+            Ax_pred_w = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
             r_pred_w  = Ax_pred_w - b
             sqrt_w    = torch.sqrt(w_pde)
             wr_pred   = sqrt_w * r_pred_w
@@ -1831,13 +1880,15 @@ def train_gnn_auto_trainval_pde_weighted(
             norm_wb   = torch.norm(wb) + EPS_RES
             R_pred_w  = norm_wr / norm_wb
 
-            # 物理的な（非加重）PDE 残差: GNN 解
-            Ax_pred = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_pred)
-            r_pred  = Ax_pred - b
+            # 物理的な（非加重）PDE 残差（対角スケール時は r_phys = D^(1/2) r_scaled に戻す）
+            Ax_pred = Ax_pred_w
+            r_scaled = Ax_pred - b
+            r_pred  = (diag_sqrt * r_scaled) if use_dscale else r_scaled
             norm_r_pred    = torch.norm(r_pred)
             max_abs_r_pred = torch.max(torch.abs(r_pred))
-            norm_b         = torch.norm(b)
-            norm_Ax_pred   = torch.norm(Ax_pred)
+            b_phys         = (diag_sqrt * b) if use_dscale else b
+            norm_b         = torch.norm(b_phys)
+            norm_Ax_pred   = torch.norm((b_phys + r_pred))
             R_pred_over_b  = norm_r_pred / (norm_b + EPS_RES)
             R_pred_over_Ax = norm_r_pred / (norm_Ax_pred + EPS_RES)
 
@@ -1849,11 +1900,13 @@ def train_gnn_auto_trainval_pde_weighted(
                 rmse    = torch.sqrt(torch.sum(diff * diff) / N)
 
                 # 物理的な（非加重）PDE 残差: OpenFOAM 解
-                Ax_true = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_true)
-                r_true  = Ax_true - b
+                x_true_for_pde = (x_true * diag_sqrt) if use_dscale else x_true
+                Ax_true = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_true_for_pde)
+                r_scaled_true = Ax_true - b
+                r_true  = (diag_sqrt * r_scaled_true) if use_dscale else r_scaled_true
                 norm_r_true    = torch.norm(r_true)
                 max_abs_r_true = torch.max(torch.abs(r_true))
-                norm_Ax_true   = torch.norm(Ax_true)
+                norm_Ax_true   = torch.norm((b_phys + r_true))
                 R_true_over_b  = norm_r_true / (norm_b + EPS_RES)
                 R_true_over_Ax = norm_r_true / (norm_Ax_true + EPS_RES)
 
