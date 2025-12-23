@@ -1718,7 +1718,22 @@ def train_gnn_auto_trainval_pde_weighted(
         if USE_AMP and device.type != "cuda":
             log_print("[INFO] AMP は CUDA デバイスでのみ有効です。CPU モードでは無効化されます")
 
-    log_print("=== Training start (relative data loss + weighted PDE loss, train/val split) ===")
+    # 学習モードの表示と検証
+    if LAMBDA_DATA == 0 and LAMBDA_PDE == 0:
+        raise ValueError(
+            "LAMBDA_DATA と LAMBDA_PDE が両方 0 です。"
+            "少なくとも一方は正の値を設定してください。"
+        )
+
+    if LAMBDA_DATA == 0:
+        learning_mode = "完全な教師なし学習 (PDE損失のみ)"
+    elif LAMBDA_PDE == 0:
+        learning_mode = "完全な教師あり学習 (データ損失のみ)"
+    else:
+        learning_mode = "ハイブリッド学習 (データ損失 + PDE損失)"
+
+    log_print(f"=== Training start: {learning_mode} ===")
+    log_print(f"    LAMBDA_DATA={LAMBDA_DATA}, LAMBDA_PDE={LAMBDA_PDE}, LAMBDA_GAUGE={LAMBDA_GAUGE}")
 
     # --- 可視化用の準備 ---
     fig, axes = (None, None)
@@ -1784,8 +1799,8 @@ def train_gnn_auto_trainval_pde_weighted(
                 # 非正規化スケールに戻す
                 x_pred = x_pred_norm * x_std_t + x_mean_t
 
-                # データ損失: x_true がある場合のみ計算
-                if has_x_true and x_true is not None:
+                # データ損失: x_true がある場合かつ LAMBDA_DATA > 0 のときのみ計算
+                if has_x_true and x_true is not None and LAMBDA_DATA > 0:
                     # rank ごとの mean/std を用いた x の正規化（data loss 用）
                     rank_id = int(cs["rank"])
                     mean_r  = x_mean_rank_t[rank_id]
@@ -1802,44 +1817,49 @@ def train_gnn_auto_trainval_pde_weighted(
                     )
                     num_cases_with_x += 1
                 else:
-                    # 教師なし学習: データ損失は 0
+                    # 教師なし学習 または LAMBDA_DATA = 0: データ損失は計算しない
                     data_loss_case = None
 
-                # PDE 損失: 安定した正規化方式
-                # 対角スケーリング有効時は、A_scaled x_scaled = b_scaled を評価
-                x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
-                Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
-                r  = Ax - b
+                # PDE 損失: LAMBDA_PDE > 0 の場合のみ計算
+                if LAMBDA_PDE > 0:
+                    # 対角スケーリング有効時は、A_scaled x_scaled = b_scaled を評価
+                    x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
+                    Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
+                    r  = Ax - b
 
-                # PDE損失の正規化
-                sqrt_w = torch.sqrt(w_pde)
-                wr = sqrt_w * r
-                wb = sqrt_w * b
+                    # PDE損失の正規化
+                    sqrt_w = torch.sqrt(w_pde)
+                    wr = sqrt_w * r
+                    wb = sqrt_w * b
 
-                if PDE_LOSS_NORMALIZATION == "relative":
-                    # 相対残差ノルム: ||w*r||² / ||w*b||²
-                    # 物理的に意味があり、||r||/||b|| ≈ 1 のとき pde_loss ≈ 1
-                    norm_wr_sq = torch.sum(wr * wr)
-                    norm_wb_sq = torch.sum(wb * wb) + EPS_RES
-                    pde_loss_case = norm_wr_sq / norm_wb_sq
-                elif PDE_LOSS_NORMALIZATION == "row_diag":
-                    # 行ごと正規化（対角成分でスケール）- 値が極小になる問題あり
-                    diag_abs = torch.abs(diag) + EPS_RES
-                    r_normalized = r / diag_abs
-                    wr_norm = sqrt_w * r_normalized
-                    pde_loss_case = torch.mean(wr_norm * wr_norm)
+                    if PDE_LOSS_NORMALIZATION == "relative":
+                        # 相対残差ノルム: ||w*r||² / ||w*b||²
+                        # 物理的に意味があり、||r||/||b|| ≈ 1 のとき pde_loss ≈ 1
+                        norm_wr_sq = torch.sum(wr * wr)
+                        norm_wb_sq = torch.sum(wb * wb) + EPS_RES
+                        pde_loss_case = norm_wr_sq / norm_wb_sq
+                    elif PDE_LOSS_NORMALIZATION == "row_diag":
+                        # 行ごと正規化（対角成分でスケール）- 値が極小になる問題あり
+                        diag_abs = torch.abs(diag) + EPS_RES
+                        r_normalized = r / diag_abs
+                        wr_norm = sqrt_w * r_normalized
+                        pde_loss_case = torch.mean(wr_norm * wr_norm)
+                    else:
+                        # "none": ||r||² / (||Ax||² + ||b||² + eps)
+                        wAx = sqrt_w * Ax
+                        norm_wr = torch.norm(wr)
+                        norm_scale = torch.sqrt(torch.norm(wAx)**2 + torch.norm(wb)**2) + EPS_RES
+                        pde_loss_case = (norm_wr / norm_scale) ** 2
+
+                    # 診断用の相対残差（ログ出力用）
+                    with torch.no_grad():
+                        norm_wr_diag = torch.norm(sqrt_w * r)
+                        norm_wb_diag = torch.norm(sqrt_w * b) + EPS_RES
+                        R_pred = norm_wr_diag / norm_wb_diag
                 else:
-                    # "none": ||r||² / (||Ax||² + ||b||² + eps)
-                    wAx = sqrt_w * Ax
-                    norm_wr = torch.norm(wr)
-                    norm_scale = torch.sqrt(torch.norm(wAx)**2 + torch.norm(wb)**2) + EPS_RES
-                    pde_loss_case = (norm_wr / norm_scale) ** 2
-
-                # 診断用の相対残差（ログ出力用）
-                with torch.no_grad():
-                    norm_wr_diag = torch.norm(sqrt_w * r)
-                    norm_wb_diag = torch.norm(sqrt_w * b) + EPS_RES
-                    R_pred = norm_wr_diag / norm_wb_diag
+                    # LAMBDA_PDE = 0: PDE損失は計算しない（完全な教師あり学習）
+                    pde_loss_case = None
+                    R_pred = torch.tensor(0.0, device=device)
 
                 # ゲージ損失: セル体積で重み付けした平均値の二乗（物理的に意味のある平均）
                 # 圧力ポアソン方程式の解は定数の不定性（ゲージ自由度）があるため、
@@ -1849,14 +1869,28 @@ def train_gnn_auto_trainval_pde_weighted(
                 gauge_loss_case = weighted_mean ** 2
 
             # ---- 目的関数（平均化を保ったまま、ケースごとに backward して勾配蓄積）----
-            loss_case = (LAMBDA_PDE / num_train) * pde_loss_case + (LAMBDA_GAUGE / num_train) * gauge_loss_case
-            if (not unsupervised_mode) and (num_train_with_x > 0) and (data_loss_case is not None):
+            # 各損失項を条件に応じて加算
+            loss_case = torch.tensor(0.0, device=device, requires_grad=True)
+
+            # PDE損失（LAMBDA_PDE > 0 の場合のみ）
+            if pde_loss_case is not None:
+                loss_case = loss_case + (LAMBDA_PDE / num_train) * pde_loss_case
+
+            # ゲージ損失（常に加算、ただしLAMBDA_GAUGE > 0 の場合のみ実効的）
+            if LAMBDA_GAUGE > 0:
+                loss_case = loss_case + (LAMBDA_GAUGE / num_train) * gauge_loss_case
+
+            # データ損失（LAMBDA_DATA > 0 かつ x_true がある場合のみ）
+            if data_loss_case is not None:
                 loss_case = loss_case + (LAMBDA_DATA / num_train_with_x) * data_loss_case
 
-            scaler.scale(loss_case).backward()
+            # 少なくとも1つの損失がある場合のみ backward
+            if loss_case.requires_grad:
+                scaler.scale(loss_case).backward()
 
             # logging用（グラフを持たない形で集計）
-            total_pde_loss += float(pde_loss_case.detach().cpu())
+            if pde_loss_case is not None:
+                total_pde_loss += float(pde_loss_case.detach().cpu())
             total_gauge_loss += float(gauge_loss_case.detach().cpu())
             if data_loss_case is not None:
                 total_data_loss += float(data_loss_case.detach().cpu())
@@ -1890,14 +1924,22 @@ def train_gnn_auto_trainval_pde_weighted(
         scaler.update()
 
         # epoch平均（ログ・history用）
-        avg_pde_loss = total_pde_loss / max(1, num_train)
-        avg_gauge_loss = total_gauge_loss / max(1, num_train)
-        if unsupervised_mode or num_cases_with_x == 0:
+        avg_pde_loss = total_pde_loss / max(1, num_train) if LAMBDA_PDE > 0 else 0.0
+        avg_gauge_loss = total_gauge_loss / max(1, num_train) if LAMBDA_GAUGE > 0 else 0.0
+
+        # 損失値の計算（各項はlambda > 0の場合のみ加算）
+        loss_value = 0.0
+        if LAMBDA_PDE > 0:
+            loss_value += LAMBDA_PDE * avg_pde_loss
+        if LAMBDA_GAUGE > 0:
+            loss_value += LAMBDA_GAUGE * avg_gauge_loss
+
+        # データ損失
+        if unsupervised_mode or num_cases_with_x == 0 or LAMBDA_DATA == 0:
             avg_data_loss = 0.0
-            loss_value = (LAMBDA_PDE * avg_pde_loss) + (LAMBDA_GAUGE * avg_gauge_loss)
         else:
             avg_data_loss = total_data_loss / max(1, num_cases_with_x)
-            loss_value = (LAMBDA_DATA * avg_data_loss) + (LAMBDA_PDE * avg_pde_loss) + (LAMBDA_GAUGE * avg_gauge_loss)
+            loss_value += LAMBDA_DATA * avg_data_loss
         avg_rel_err_val = None
         avg_R_pred_val = None
         avg_rmse_val = None

@@ -157,15 +157,42 @@ def objective(
     log_file: Path,
     lambda_gauge: float,
     search_lambda_gauge: bool,
+    lambda_data_min: float,
+    lambda_data_max: float,
+    lambda_pde_min: float,
+    lambda_pde_max: float,
 ) -> float:
     """Optuna 用の目的関数。"""
 
     # サンプルするハイパーパラメータ
     lr = trial.suggest_float(name="lr", low=1e-4, high=1e-2, log=True)
     weight_decay = trial.suggest_float(name="weight_decay", low=1e-6, high=1e-3, log=True)
-    lambda_data = trial.suggest_float(name="lambda_data", low=1e-3, high=1.0, log=True)
-    # PDE損失の探索範囲を広げる（教師なし学習では大きな値が有効）
-    lambda_pde = trial.suggest_float(name="lambda_pde", low=0.01, high=10.0, log=True)
+
+    # lambda_data の決定
+    # min == max == 0 の場合は固定値 0（完全な教師なし学習）
+    # min == max > 0 の場合は固定値
+    # min < max の場合は探索（log scale）
+    if lambda_data_min == 0 and lambda_data_max == 0:
+        lambda_data = 0.0
+    elif lambda_data_min == lambda_data_max:
+        lambda_data = lambda_data_min
+    elif lambda_data_min > 0:
+        lambda_data = trial.suggest_float(name="lambda_data", low=lambda_data_min, high=lambda_data_max, log=True)
+    else:
+        # min == 0 but max > 0: 線形スケールで探索（log scale は 0 を含められない）
+        lambda_data = trial.suggest_float(name="lambda_data", low=lambda_data_min, high=lambda_data_max, log=False)
+
+    # lambda_pde の決定（同様のロジック）
+    if lambda_pde_min == 0 and lambda_pde_max == 0:
+        lambda_pde = 0.0
+    elif lambda_pde_min == lambda_pde_max:
+        lambda_pde = lambda_pde_min
+    elif lambda_pde_min > 0:
+        lambda_pde = trial.suggest_float(name="lambda_pde", low=lambda_pde_min, high=lambda_pde_max, log=True)
+    else:
+        # min == 0 but max > 0: 線形スケールで探索
+        lambda_pde = trial.suggest_float(name="lambda_pde", low=lambda_pde_min, high=lambda_pde_max, log=False)
+
     hidden_channels = trial.suggest_int("hidden_channels", 32, 256, log=True)
     num_layers = trial.suggest_int("num_layers", 3, 7)
 
@@ -310,6 +337,32 @@ def main() -> None:
         action="store_true",
         help="対角スケーリングを無効化（条件数改善を行わない）",
     )
+    # lambda_data の探索範囲
+    parser.add_argument(
+        "--lambda_data_min",
+        type=float,
+        default=1e-3,
+        help="lambda_data の探索下限（デフォルト: 1e-3）。0 を指定すると固定値 0（完全な教師なし学習）",
+    )
+    parser.add_argument(
+        "--lambda_data_max",
+        type=float,
+        default=1.0,
+        help="lambda_data の探索上限（デフォルト: 1.0）",
+    )
+    # lambda_pde の探索範囲
+    parser.add_argument(
+        "--lambda_pde_min",
+        type=float,
+        default=0.01,
+        help="lambda_pde の探索下限（デフォルト: 0.01）。0 を指定すると固定値 0（完全な教師あり学習）",
+    )
+    parser.add_argument(
+        "--lambda_pde_max",
+        type=float,
+        default=10.0,
+        help="lambda_pde の探索上限（デフォルト: 10.0）",
+    )
 
     args = parser.parse_args()
 
@@ -333,6 +386,16 @@ def main() -> None:
     # ログファイルを探索開始前に準備
     _initialize_log_file(args.log_file)
 
+    # lambda 範囲の検証
+    if args.lambda_data_min == 0 and args.lambda_pde_min == 0 and args.lambda_data_max == 0 and args.lambda_pde_max == 0:
+        raise ValueError(
+            "lambda_data と lambda_pde が両方とも 0 に固定されています。"
+            "少なくとも一方は正の値を設定してください。"
+        )
+
+    print(f"[INFO] lambda_data 範囲: [{args.lambda_data_min}, {args.lambda_data_max}]")
+    print(f"[INFO] lambda_pde 範囲: [{args.lambda_pde_min}, {args.lambda_pde_max}]")
+
     # Optuna 探索本体
     study.optimize(
         lambda trial: objective(
@@ -345,6 +408,10 @@ def main() -> None:
             args.log_file,
             args.lambda_gauge,
             args.search_lambda_gauge,
+            args.lambda_data_min,
+            args.lambda_data_max,
+            args.lambda_pde_min,
+            args.lambda_pde_max,
         ),
         n_trials=args.trials,
         show_progress_bar=True,
