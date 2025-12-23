@@ -2179,13 +2179,41 @@ def train_gnn_auto_trainval_pde_weighted(
                 f"||r||/||Ax||={R_pred_over_Ax.item():.5f}"
             )
 
-        # 予測結果の書き出し
+        # 予測結果の書き出し（従来形式: インデックスと値）
         x_pred_np = x_pred.cpu().numpy().reshape(-1)
         out_path = os.path.join(OUTPUT_DIR, f"x_pred_train_{time_str}_rank{rank_str}.dat")
         with open(out_path, "w") as f:
             for i, val in enumerate(x_pred_np):
                 f.write(f"{i} {val:.9e}\n")
         log_print(f"    [INFO] train x_pred を {out_path} に書き出しました。")
+
+        # 3次元比較用CSV出力（座標付き）
+        coords_np = cs["coords_np"]  # (N, 3): x, y, z
+        csv_pred_path = os.path.join(OUTPUT_DIR, f"pressure_pred_train_{time_str}_rank{rank_str}.csv")
+        with open(csv_pred_path, "w") as f:
+            f.write("x,y,z,p_pred\n")
+            for i in range(len(x_pred_np)):
+                f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_pred_np[i]:.9e}\n")
+        log_print(f"    [INFO] 予測値CSV を {csv_pred_path} に書き出しました。")
+
+        # 真値がある場合は真値CSVも出力
+        if has_x_true and x_true is not None:
+            x_true_np = x_true.cpu().numpy().reshape(-1)
+            csv_true_path = os.path.join(OUTPUT_DIR, f"pressure_true_train_{time_str}_rank{rank_str}.csv")
+            with open(csv_true_path, "w") as f:
+                f.write("x,y,z,p_true\n")
+                for i in range(len(x_true_np)):
+                    f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_true_np[i]:.9e}\n")
+            log_print(f"    [INFO] 真値CSV を {csv_true_path} に書き出しました。")
+
+            # 真値と予測値を並べた比較用CSV
+            csv_compare_path = os.path.join(OUTPUT_DIR, f"pressure_compare_train_{time_str}_rank{rank_str}.csv")
+            with open(csv_compare_path, "w") as f:
+                f.write("x,y,z,p_true,p_pred,error\n")
+                for i in range(len(x_pred_np)):
+                    error = x_pred_np[i] - x_true_np[i]
+                    f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_true_np[i]:.9e},{x_pred_np[i]:.9e},{error:.9e}\n")
+            log_print(f"    [INFO] 比較CSV を {csv_compare_path} に書き出しました。")
 
         # ★ 誤差場の可視化（train ケース、x_true がある場合のみ）
         if enable_error_plots and has_x_true and x_true is not None and num_error_plots_train < MAX_ERROR_PLOT_CASES_TRAIN:
@@ -2336,6 +2364,34 @@ def train_gnn_auto_trainval_pde_weighted(
                 for i, val in enumerate(x_pred_np):
                     f.write(f"{i} {val:.9e}\n")
             log_print(f"    [INFO] val x_pred を {out_path} に書き出しました。")
+
+            # 3次元比較用CSV出力（座標付き）
+            coords_np = cs["coords_np"]  # (N, 3): x, y, z
+            csv_pred_path = os.path.join(OUTPUT_DIR, f"pressure_pred_val_{time_str}_rank{rank_str}.csv")
+            with open(csv_pred_path, "w") as f:
+                f.write("x,y,z,p_pred\n")
+                for i in range(len(x_pred_np)):
+                    f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_pred_np[i]:.9e}\n")
+            log_print(f"    [INFO] 予測値CSV を {csv_pred_path} に書き出しました。")
+
+            # 真値がある場合は真値CSVも出力
+            if has_x_true and x_true is not None:
+                x_true_np = x_true.cpu().numpy().reshape(-1)
+                csv_true_path = os.path.join(OUTPUT_DIR, f"pressure_true_val_{time_str}_rank{rank_str}.csv")
+                with open(csv_true_path, "w") as f:
+                    f.write("x,y,z,p_true\n")
+                    for i in range(len(x_true_np)):
+                        f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_true_np[i]:.9e}\n")
+                log_print(f"    [INFO] 真値CSV を {csv_true_path} に書き出しました。")
+
+                # 真値と予測値を並べた比較用CSV
+                csv_compare_path = os.path.join(OUTPUT_DIR, f"pressure_compare_val_{time_str}_rank{rank_str}.csv")
+                with open(csv_compare_path, "w") as f:
+                    f.write("x,y,z,p_true,p_pred,error\n")
+                    for i in range(len(x_pred_np)):
+                        error = x_pred_np[i] - x_true_np[i]
+                        f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_true_np[i]:.9e},{x_pred_np[i]:.9e},{error:.9e}\n")
+                log_print(f"    [INFO] 比較CSV を {csv_compare_path} に書き出しました。")
 
             # ★ 誤差場の可視化（val ケース、x_true がある場合のみ）
             if enable_error_plots and has_x_true and x_true is not None and num_error_plots_val < MAX_ERROR_PLOT_CASES_VAL:
