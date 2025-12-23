@@ -81,13 +81,17 @@ USE_DATA_CACHE = True     # データをキャッシュファイルに保存し�
 CACHE_DIR = ".cache"      # キャッシュファイルの保存先ディレクトリ
 
 LAMBDA_DATA = 0.1
-LAMBDA_PDE  = 1.0         # PDE損失の重み（教師なし学習では主要な学習信号）
+LAMBDA_PDE  = 0.01        # PDE損失の重み（relative正規化では ||r||²/||b||² ≈ 1-20 程度になるため小さめに設定）
 LAMBDA_GAUGE = 0.01       # ゲージ正則化係数（教師なし学習時の定数モード抑制用）
 
 W_PDE_MAX = 10.0  # w_pde の最大値
 USE_MESH_QUALITY_WEIGHTS = True  # メッシュ品質重みを使用（Falseで全セル等重み w=1）
 USE_DIAGONAL_SCALING = True  # 対角スケーリングを適用（条件数改善のため）
-USE_ROW_NORMALIZATION = True  # 残差の行ごと正規化を適用（勾配バランス改善）
+# PDE損失の正規化方式
+# "relative": ||r||²/||b||² (相対残差ノルム、物理的に意味があり推奨)
+# "row_diag": r/diag で行ごと正規化 (値が極小になる問題あり)
+# "none": ||r||²/(||Ax||²+||b||²+eps) 正規化
+PDE_LOSS_NORMALIZATION = "relative"
 
 EPS_DATA = 1e-12  # データ損失用 eps
 EPS_RES  = 1e-8   # 残差正規化用 eps（安定性のため大きめに設定）
@@ -1138,6 +1142,159 @@ def save_error_field_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
             f"全セル平均w_pde={mean_w_all:.3e}"
         )
 
+
+def save_pressure_comparison_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
+    """
+    圧力場の真値と予測値を比較する2D可視化を保存する。
+
+    出力:
+    1. 2D断面での圧力場比較（真値、予測値、差分の3パネル）
+    2. 散布図（x_true vs x_pred）
+    3. PDE残差のヒストグラム
+    """
+    import warnings
+
+    # ---- Torch -> NumPy ----
+    x_pred_np = x_pred.detach().cpu().numpy().reshape(-1)
+    x_true_np = x_true.detach().cpu().numpy().reshape(-1)
+
+    # ゲージ補正（平均を揃える）
+    x_pred_centered = x_pred_np - np.mean(x_pred_np)
+    x_true_centered = x_true_np - np.mean(x_true_np)
+    diff = x_pred_centered - x_true_centered
+
+    coords = cs["coords_np"]  # (N, 3): x, y, z
+    N = coords.shape[0]
+
+    if x_pred_np.shape[0] != N:
+        log_print(f"    [WARN] 可視化: 座標数 N={N} と解ベクトル長={x_pred_np.shape[0]} が一致しません ({prefix})。")
+        return
+
+    # ============================
+    # 1) 2D断面での圧力場比較（y ≒ 中央）
+    # ============================
+    y = coords[:, 1]
+    y_min, y_max = float(y.min()), float(y.max())
+    if y_max > y_min:
+        y_mid = 0.5 * (y_min + y_max)
+        band = YSLICE_FRACTIONAL_HALF_WIDTH * (y_max - y_min)
+    else:
+        y_mid = y_min
+        band = 1e-6
+
+    mask = np.abs(y - y_mid) <= band
+    n_slice = int(np.count_nonzero(mask))
+
+    if n_slice >= 10:
+        xs = coords[mask, 0]
+        zs = coords[mask, 2]
+        true_slice = x_true_centered[mask]
+        pred_slice = x_pred_centered[mask]
+        diff_slice = diff[mask]
+
+        # カラースケールを統一
+        vmin_p = min(true_slice.min(), pred_slice.min())
+        vmax_p = max(true_slice.max(), pred_slice.max())
+        vabs_diff = max(abs(diff_slice.min()), abs(diff_slice.max()))
+
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+        # 真値
+        sc0 = axes[0].scatter(xs, zs, c=true_slice, s=5, cmap="viridis", vmin=vmin_p, vmax=vmax_p)
+        axes[0].set_aspect("equal", adjustable="box")
+        axes[0].set_xlabel("x")
+        axes[0].set_ylabel("z")
+        axes[0].set_title("真値 (x_true, ゲージ補正済み)")
+        fig.colorbar(sc0, ax=axes[0], label="Pressure")
+
+        # 予測値
+        sc1 = axes[1].scatter(xs, zs, c=pred_slice, s=5, cmap="viridis", vmin=vmin_p, vmax=vmax_p)
+        axes[1].set_aspect("equal", adjustable="box")
+        axes[1].set_xlabel("x")
+        axes[1].set_ylabel("z")
+        axes[1].set_title("予測値 (x_pred, ゲージ補正済み)")
+        fig.colorbar(sc1, ax=axes[1], label="Pressure")
+
+        # 差分
+        sc2 = axes[2].scatter(xs, zs, c=diff_slice, s=5, cmap="coolwarm", vmin=-vabs_diff, vmax=vabs_diff)
+        axes[2].set_aspect("equal", adjustable="box")
+        axes[2].set_xlabel("x")
+        axes[2].set_ylabel("z")
+        axes[2].set_title("差分 (x_pred - x_true)")
+        fig.colorbar(sc2, ax=axes[2], label="Difference")
+
+        fig.suptitle(f"圧力場比較 ({prefix}, y≒中央断面, n={n_slice}セル)", fontsize=12)
+        fig.tight_layout()
+
+        out_compare = os.path.join(output_dir, f"pressure_comparison_{prefix}.png")
+        fig.savefig(out_compare, dpi=200)
+        plt.close(fig)
+        log_print(f"    [PLOT] 圧力場比較図を {out_compare} に保存しました。")
+
+    # ============================
+    # 2) 散布図（x_true vs x_pred）
+    # ============================
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # サンプリング（大規模メッシュ対応）
+    if N > MAX_POINTS_3D_SCATTER:
+        idx = np.random.choice(N, size=MAX_POINTS_3D_SCATTER, replace=False)
+    else:
+        idx = np.arange(N)
+
+    # 散布図
+    axes[0].scatter(x_true_centered[idx], x_pred_centered[idx], s=1, alpha=0.3, c='blue')
+
+    # 45度線
+    lim_min = min(x_true_centered[idx].min(), x_pred_centered[idx].min())
+    lim_max = max(x_true_centered[idx].max(), x_pred_centered[idx].max())
+    axes[0].plot([lim_min, lim_max], [lim_min, lim_max], 'r-', lw=2, label='y=x (理想)')
+
+    # 回帰直線
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if np.std(x_true_centered[idx]) > 0:
+            coef = np.polyfit(x_true_centered[idx], x_pred_centered[idx], 1)
+            poly = np.poly1d(coef)
+            x_line = np.linspace(lim_min, lim_max, 100)
+            axes[0].plot(x_line, poly(x_line), 'g--', lw=1.5,
+                        label=f'回帰: y={coef[0]:.4f}x+{coef[1]:.2e}')
+
+    axes[0].set_xlabel("x_true (ゲージ補正済み)")
+    axes[0].set_ylabel("x_pred (ゲージ補正済み)")
+    axes[0].set_title("真値 vs 予測値")
+    axes[0].legend(loc='upper left')
+    axes[0].set_aspect('equal', adjustable='box')
+    axes[0].grid(True, alpha=0.3)
+
+    # 差分のヒストグラム
+    axes[1].hist(diff, bins=100, density=True, alpha=0.7, color='steelblue', edgecolor='black')
+    axes[1].axvline(0, color='red', linestyle='--', lw=2, label='ゼロ')
+    axes[1].axvline(np.mean(diff), color='green', linestyle='-', lw=2,
+                   label=f'平均: {np.mean(diff):.2e}')
+    axes[1].set_xlabel("差分 (x_pred - x_true)")
+    axes[1].set_ylabel("確率密度")
+    axes[1].set_title(f"差分ヒストグラム (std={np.std(diff):.2e})")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    # 相関係数とRMSEを注記
+    if np.std(x_true_centered) > 0 and np.std(x_pred_centered) > 0:
+        corr = np.corrcoef(x_true_centered, x_pred_centered)[0, 1]
+    else:
+        corr = float('nan')
+    rmse = np.sqrt(np.mean(diff**2))
+    rel_err = np.linalg.norm(diff) / (np.linalg.norm(x_true_centered) + 1e-12)
+
+    fig.suptitle(f"予測精度評価 ({prefix}): R={corr:.4f}, RMSE={rmse:.2e}, RelErr={rel_err:.2%}", fontsize=12)
+    fig.tight_layout()
+
+    out_scatter = os.path.join(output_dir, f"scatter_comparison_{prefix}.png")
+    fig.savefig(out_scatter, dpi=200)
+    plt.close(fig)
+    log_print(f"    [PLOT] 散布図・ヒストグラムを {out_scatter} に保存しました。")
+
+
 # ------------------------------------------------------------
 # 可視化ユーティリティ
 # ------------------------------------------------------------
@@ -1654,21 +1811,27 @@ def train_gnn_auto_trainval_pde_weighted(
                 Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
                 r  = Ax - b
 
-                # 行ごと正規化（対角成分でスケール）
-                if USE_ROW_NORMALIZATION:
+                # PDE損失の正規化
+                sqrt_w = torch.sqrt(w_pde)
+                wr = sqrt_w * r
+                wb = sqrt_w * b
+
+                if PDE_LOSS_NORMALIZATION == "relative":
+                    # 相対残差ノルム: ||w*r||² / ||w*b||²
+                    # 物理的に意味があり、||r||/||b|| ≈ 1 のとき pde_loss ≈ 1
+                    norm_wr_sq = torch.sum(wr * wr)
+                    norm_wb_sq = torch.sum(wb * wb) + EPS_RES
+                    pde_loss_case = norm_wr_sq / norm_wb_sq
+                elif PDE_LOSS_NORMALIZATION == "row_diag":
+                    # 行ごと正規化（対角成分でスケール）- 値が極小になる問題あり
                     diag_abs = torch.abs(diag) + EPS_RES
                     r_normalized = r / diag_abs
-                    sqrt_w = torch.sqrt(w_pde)
-                    wr = sqrt_w * r_normalized
-                    # 正規化された残差の二乗平均
-                    pde_loss_case = torch.mean(wr * wr)
+                    wr_norm = sqrt_w * r_normalized
+                    pde_loss_case = torch.mean(wr_norm * wr_norm)
                 else:
-                    sqrt_w = torch.sqrt(w_pde)
-                    wr = sqrt_w * r
+                    # "none": ||r||² / (||Ax||² + ||b||² + eps)
                     wAx = sqrt_w * Ax
-                    wb = sqrt_w * b
                     norm_wr = torch.norm(wr)
-                    # 安定した正規化: ||r||² / (||Ax||² + ||b||² + eps)
                     norm_scale = torch.sqrt(torch.norm(wAx)**2 + torch.norm(wb)**2) + EPS_RES
                     pde_loss_case = (norm_wr / norm_scale) ** 2
 
@@ -1986,6 +2149,7 @@ def train_gnn_auto_trainval_pde_weighted(
         if enable_error_plots and has_x_true and x_true is not None and num_error_plots_train < MAX_ERROR_PLOT_CASES_TRAIN:
             prefix = f"train_time{time_str}_rank{rank_str}"
             save_error_field_plots(cs, x_pred, x_true, prefix)
+            save_pressure_comparison_plots(cs, x_pred, x_true, prefix)
             num_error_plots_train += 1
 
         # 遅延ロードの場合、GPU メモリを解放
@@ -2135,6 +2299,7 @@ def train_gnn_auto_trainval_pde_weighted(
             if enable_error_plots and has_x_true and x_true is not None and num_error_plots_val < MAX_ERROR_PLOT_CASES_VAL:
                 prefix = f"val_time{time_str}_rank{rank_str}"
                 save_error_field_plots(cs, x_pred, x_true, prefix)
+                save_pressure_comparison_plots(cs, x_pred, x_true, prefix)
                 num_error_plots_val += 1
 
             # 遅延ロードの場合、GPU メモリを解放

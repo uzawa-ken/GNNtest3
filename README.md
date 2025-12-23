@@ -181,8 +181,11 @@ USE_MESH_QUALITY_WEIGHTS = True  # メッシュ品質重みを使用（Falseで�
 # 対角スケーリングオプション（条件数改善）
 USE_DIAGONAL_SCALING = True      # 対角スケーリングを適用（A_scaled = D^(-1/2) A D^(-1/2)）
 
-# 残差の行ごと正規化（勾配バランス改善）
-USE_ROW_NORMALIZATION = True     # 対角成分で残差を正規化（各行のスケールを揃える）
+# PDE損失の正規化方式
+# "relative": ||r||²/||b||² (相対残差ノルム、物理的に意味があり推奨)
+# "row_diag": r/diag で行ごと正規化 (値が極小になる問題あり)
+# "none": ||r||²/(||Ax||²+||b||²+eps) 正規化
+PDE_LOSS_NORMALIZATION = "relative"
 ```
 
 ### 3. 実行
@@ -438,24 +441,37 @@ $$
 
 ### PDE 損失 (L_pde)
 
-行ごと正規化されたメッシュ品質加重 PDE 残差（`USE_ROW_NORMALIZATION = True` の場合）：
+`PDE_LOSS_NORMALIZATION` 設定により3つの正規化方式を選択できます：
+
+**1. `"relative"` (推奨)**: 相対残差ノルム
 
 $$
-L_\mathrm{pde} = \frac{1}{N_\mathrm{cells}} \sum_{i=1}^{N_\mathrm{cells}} w_i \left( \frac{r_i}{|D_{ii}|} \right)^2, \quad r = Ax_\mathrm{pred} - b
+L_\mathrm{pde} = \frac{\| \sqrt{w} \odot r \|_2^2}{\| \sqrt{w} \odot b \|_2^2 + \epsilon}, \quad r = Ax_\mathrm{pred} - b
 $$
 
-- A: 係数行列（CSR 形式）
-- b: 右辺ベクトル（ソース項）
-- D: A の対角成分（行ごとのスケーリング用）
-- w: メッシュ品質に基づく重みベクトル
+- 物理的に意味がある（||r||/||b|| ≈ 1 のとき L_pde ≈ 1）
+- data_loss とバランスしやすい値域（0.01〜100 程度）
+- 推奨: `LAMBDA_PDE = 0.01`
 
-行ごと正規化により、係数行列の各行のスケールの違いを吸収し、勾配のバランスを改善します。
+**2. `"row_diag"`**: 行ごと正規化（対角スケール）
 
-`USE_ROW_NORMALIZATION = False` の場合は、安定した正規化方式を使用：
+$$
+L_\mathrm{pde} = \frac{1}{N_\mathrm{cells}} \sum_{i=1}^{N_\mathrm{cells}} w_i \left( \frac{r_i}{|D_{ii}|} \right)^2
+$$
+
+- 各行のスケールを揃えるが、値が極端に小さくなる問題あり
+
+**3. `"none"`**: 複合正規化
 
 $$
 L_\mathrm{pde} = \frac{\| \sqrt{w} \odot r \|_2^2}{\| \sqrt{w} \odot Ax \|_2^2 + \| \sqrt{w} \odot b \|_2^2 + \epsilon}
 $$
+
+**共通の記号**:
+- A: 係数行列（CSR 形式）
+- b: 右辺ベクトル（ソース項）
+- D: A の対角成分
+- w: メッシュ品質に基づく重みベクトル
 
 ### ゲージ損失 (L_gauge)
 
@@ -525,6 +541,10 @@ $$
 | `training_history_DATA{λ1}_PDE{λ2}.png` | 訓練曲線のグラフ |
 | `x_pred_train_{time}_rank{N}.dat` | 訓練データの予測結果（各 rank ごと） |
 | `x_pred_val_{time}_rank{N}.dat` | 検証データの予測結果（各 rank ごと） |
+| `pressure_comparison_{prefix}.png` | 2D断面での圧力場比較（真値、予測値、差分） |
+| `scatter_comparison_{prefix}.png` | 散布図（真値 vs 予測値）と誤差ヒストグラム |
+| `error3d_{prefix}.png` | 誤差場の3D散布図 |
+| `error2d_yMid_{prefix}.png` | 誤差場とメッシュ品質重みの2Dカラーマップ |
 
 ## 技術的詳細
 
@@ -539,6 +559,22 @@ $$
 - 各エポックで全ての (time, rank) ケースを用いて損失を計算し、モデルを更新します
 
 ## 変更履歴
+
+### 2025-12-23: PDE損失正規化の修正と可視化機能の追加
+
+#### PDE損失正規化の修正
+- **`PDE_LOSS_NORMALIZATION` 設定を追加**: 3つの正規化方式から選択可能
+  - `"relative"` (推奨): 相対残差ノルム `||r||²/||b||²`
+  - `"row_diag"`: 対角成分による行ごと正規化
+  - `"none"`: 複合正規化 `||r||²/(||Ax||²+||b||²)`
+- **`LAMBDA_PDE` を 1.0 から 0.01 に変更**: 新しい正規化方式に合わせて調整
+- **問題の修正**: 従来の行ごと正規化（r/diag）では PDE_loss が 1e-10〜1e-12 と極端に小さくなり、実質的に PDE 損失から学習が行われない問題を修正
+
+#### 可視化機能の追加
+- **圧力場比較プロット**: 2D断面での真値・予測値・差分の3パネル表示
+- **散布図**: 真値 vs 予測値の散布図（45度線と回帰直線付き）
+- **誤差ヒストグラム**: 予測誤差の分布を可視化
+- **相関係数・RMSE・相対誤差を図中に表示**
 
 ### 2025-12-22: PDE損失の改善とモデルアーキテクチャ更新
 

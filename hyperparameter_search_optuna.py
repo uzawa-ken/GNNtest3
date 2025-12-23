@@ -52,7 +52,7 @@ def _set_global_params(
     random_seed: int,
     use_lr_warmup: bool = True,
     use_grad_clip: bool = True,
-    use_row_normalization: bool = True,
+    pde_loss_normalization: str = "relative",
 ) -> None:
     """GNN トレーニングスクリプトのグローバル設定を上書きするヘルパー。"""
 
@@ -69,7 +69,7 @@ def _set_global_params(
     gnn.RANDOM_SEED = random_seed
     gnn.USE_LR_WARMUP = use_lr_warmup
     gnn.USE_GRAD_CLIP = use_grad_clip
-    gnn.USE_ROW_NORMALIZATION = use_row_normalization
+    gnn.PDE_LOSS_NORMALIZATION = pde_loss_normalization
 
 
 def _initialize_log_file(log_file: Path) -> None:
