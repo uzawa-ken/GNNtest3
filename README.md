@@ -560,12 +560,38 @@ $$
 |-----------|------|
 | `log_DATA{λ1}_PDE{λ2}.txt` | 訓練ログ（エポックごとの損失値など） |
 | `training_history_DATA{λ1}_PDE{λ2}.png` | 訓練曲線のグラフ |
-| `x_pred_train_{time}_rank{N}.dat` | 訓練データの予測結果（各 rank ごと） |
-| `x_pred_val_{time}_rank{N}.dat` | 検証データの予測結果（各 rank ごと） |
+| `x_pred_train_{time}_rank{N}.dat` | 訓練データの予測結果（各 rank ごと、従来形式） |
+| `x_pred_val_{time}_rank{N}.dat` | 検証データの予測結果（各 rank ごと、従来形式） |
+| `pressure_pred_train_{time}_rank{N}.csv` | 予測圧力（座標付きCSV） |
+| `pressure_pred_val_{time}_rank{N}.csv` | 検証データの予測圧力（座標付きCSV） |
+| `pressure_true_train_{time}_rank{N}.csv` | 真値圧力（座標付きCSV、x_trueがある場合） |
+| `pressure_true_val_{time}_rank{N}.csv` | 検証データの真値圧力（座標付きCSV） |
+| `pressure_compare_train_{time}_rank{N}.csv` | 真値・予測値・誤差の比較（座標付きCSV） |
+| `pressure_compare_val_{time}_rank{N}.csv` | 検証データの比較（座標付きCSV） |
 | `pressure_comparison_{prefix}.png` | 2D断面での圧力場比較（真値、予測値、差分） |
 | `scatter_comparison_{prefix}.png` | 散布図（真値 vs 予測値）と誤差ヒストグラム |
 | `error3d_{prefix}.png` | 誤差場の3D散布図 |
 | `error2d_yMid_{prefix}.png` | 誤差場とメッシュ品質重みの2Dカラーマップ |
+
+### CSV ファイル形式（3次元可視化用）
+
+予測値・真値のCSVファイルは以下の形式で出力されます：
+
+```csv
+x,y,z,p_pred
+1.234567890e-01,2.345678901e-02,3.456789012e-03,1.000000000e+02
+...
+```
+
+比較用CSVファイルは以下の形式で出力されます：
+
+```csv
+x,y,z,p_true,p_pred,error
+1.234567890e-01,2.345678901e-02,3.456789012e-03,1.000000000e+02,1.010000000e+02,1.000000000e+00
+...
+```
+
+これらのCSVファイルは、ParaView、Python、MATLAB等で3次元可視化や解析に使用できます。
 
 ## 技術的詳細
 
