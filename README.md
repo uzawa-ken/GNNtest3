@@ -14,6 +14,8 @@ OpenFOAM の数値解析結果を用いてグラフニューラルネットワ�
 - **メッシュ品質適応**: スキュー、非直交性、アスペクト比などのメッシュ品質指標に基づいて学習重みを動的に調整
 - **リアルタイム可視化**: 訓練過程をリアルタイムでグラフ表示
 - **教師なし学習対応**: OpenFOAM の解がない場合は自動的に PDE 損失のみで学習（PINNs 的アプローチ）
+- **安定した学習**: 勾配クリッピング、学習率ウォームアップ、LayerNorm による安定化
+- **改善されたモデル**: 残差接続（Skip connections）と LayerNorm を備えた GraphSAGE
 
 ## 必要条件
 
@@ -152,6 +154,14 @@ LR_SCHED_FACTOR = 0.5          # 学習率を何倍に下げるか
 LR_SCHED_PATIENCE = 20         # 何エポック改善が無ければ下げるか
 LR_SCHED_MIN_LR = 1e-6         # 学習率の下限
 
+# 学習率ウォームアップ
+USE_LR_WARMUP = True           # 学習初期に学習率を徐々に上げる
+LR_WARMUP_EPOCHS = 10          # ウォームアップするエポック数
+
+# 勾配クリッピング
+USE_GRAD_CLIP = True           # 勾配ノルムをクリップして学習を安定化
+GRAD_CLIP_MAX_NORM = 1.0       # 勾配ノルムの最大値
+
 # メモリ効率化オプション
 USE_LAZY_LOADING = True        # 遅延GPU転送（大規模データ向け）
 USE_AMP = True                 # 混合精度学習（Automatic Mixed Precision）
@@ -162,7 +172,7 @@ CACHE_DIR = ".cache"           # キャッシュファイルの保存先ディ�
 
 # 損失関数の重み
 LAMBDA_DATA = 0.1              # データ損失の重み
-LAMBDA_PDE  = 0.0001           # PDE 損失の重み
+LAMBDA_PDE  = 1.0              # PDE 損失の重み（教師なし学習では主要な学習信号）
 LAMBDA_GAUGE = 0.01            # ゲージ正則化係数（教師なし学習時）
 
 # メッシュ品質重みオプション
@@ -170,6 +180,9 @@ USE_MESH_QUALITY_WEIGHTS = True  # メッシュ品質重みを使用（Falseで�
 
 # 対角スケーリングオプション（条件数改善）
 USE_DIAGONAL_SCALING = True      # 対角スケーリングを適用（A_scaled = D^(-1/2) A D^(-1/2)）
+
+# 残差の行ごと正規化（勾配バランス改善）
+USE_ROW_NORMALIZATION = True     # 対角成分で残差を正規化（各行のスケールを揃える）
 ```
 
 ### 3. 実行
@@ -365,14 +378,21 @@ $$
 
 ## モデルアーキテクチャ
 
-GraphSAGE ベースの多層ニューラルネットワークを使用しています（デフォルトは 64 チャネル・4 層、Optuna から `hidden_channels` と `num_layers` を調整可能）。
+改善版 GraphSAGE ベースの多層ニューラルネットワークを使用しています（デフォルトは 64 チャネル・4 層、Optuna から `hidden_channels` と `num_layers` を調整可能）。
 
-| 層 | 入力次元 | 出力次元 | 活性化関数 |
-|---|---------|---------|----------|
-| conv1 | 13 | 64 | ReLU |
-| conv2 | 64 | 64 | ReLU |
-| conv3 | 64 | 64 | ReLU |
-| conv4 | 64 | 1 | なし |
+### アーキテクチャの特徴
+
+- **入力射影層**: 入力特徴量を隠れ次元に射影（残差接続のため）
+- **LayerNorm**: 各畳み込み層の後に正規化を適用し、学習を安定化
+- **残差接続**: 中間層で残差接続を適用し、勾配の流れを改善
+
+| 層 | 入力次元 | 出力次元 | 活性化関数 | 正規化 | 残差接続 |
+|---|---------|---------|----------|--------|---------|
+| input_proj | 13 | 64 | ReLU | - | - |
+| conv1 | 64 | 64 | ReLU | LayerNorm | ✓ |
+| conv2 | 64 | 64 | ReLU | LayerNorm | ✓ |
+| conv3 | 64 | 64 | ReLU | LayerNorm | ✓ |
+| conv4 | 64 | 1 | なし | - | - |
 
 ### 入力特徴量（13 次元）
 
@@ -392,13 +412,13 @@ GraphSAGE ベースの多層ニューラルネットワークを使用してい�
 
 ## 損失関数
 
-総損失は以下の 2 つの項の重み付き和です：
+総損失は以下の 3 つの項の重み付き和です：
 
 $$
-\mathcal{L} = \lambda_\mathrm{data} \cdot L_\mathrm{data} + \lambda_\mathrm{pde} \cdot L_\mathrm{pde}
+\mathcal{L} = \lambda_\mathrm{data} \cdot L_\mathrm{data} + \lambda_\mathrm{pde} \cdot L_\mathrm{pde} + \lambda_\mathrm{gauge} \cdot L_\mathrm{gauge}
 $$
 
-デフォルト値: λ_data = 0.1, λ_pde = 0.0001
+デフォルト値: λ_data = 0.1, λ_pde = 1.0, λ_gauge = 0.01
 
 ### データ損失 (L_data)
 
@@ -418,16 +438,36 @@ $$
 
 ### PDE 損失 (L_pde)
 
-メッシュ品質に基づく加重 PDE 残差ノルム：
+行ごと正規化されたメッシュ品質加重 PDE 残差（`USE_ROW_NORMALIZATION = True` の場合）：
 
 $$
-L_\mathrm{pde} = \frac{1}{N_\mathrm{cases}} \sum_{k=1}^{N_\mathrm{cases}} \| \sqrt{w} \odot r^{(k)} \|_2, \quad r = Ax_\mathrm{pred} - b
+L_\mathrm{pde} = \frac{1}{N_\mathrm{cells}} \sum_{i=1}^{N_\mathrm{cells}} w_i \left( \frac{r_i}{|D_{ii}|} \right)^2, \quad r = Ax_\mathrm{pred} - b
 $$
 
 - A: 係数行列（CSR 形式）
 - b: 右辺ベクトル（ソース項）
+- D: A の対角成分（行ごとのスケーリング用）
 - w: メッシュ品質に基づく重みベクトル
-- ⊙: 要素ごとの積（Hadamard 積）
+
+行ごと正規化により、係数行列の各行のスケールの違いを吸収し、勾配のバランスを改善します。
+
+`USE_ROW_NORMALIZATION = False` の場合は、安定した正規化方式を使用：
+
+$$
+L_\mathrm{pde} = \frac{\| \sqrt{w} \odot r \|_2^2}{\| \sqrt{w} \odot Ax \|_2^2 + \| \sqrt{w} \odot b \|_2^2 + \epsilon}
+$$
+
+### ゲージ損失 (L_gauge)
+
+セル体積で重み付けした予測値の平均の二乗（定数モード抑制用）：
+
+$$
+L_\mathrm{gauge} = \left( \frac{\sum_{i=1}^{N_\mathrm{cells}} V_i \cdot x_{\mathrm{pred},i}}{\sum_{i=1}^{N_\mathrm{cells}} V_i} \right)^2
+$$
+
+- V_i: セル i の体積
+
+セル体積による重み付けにより、物理的に意味のある平均値を計算します。
 
 ### 対角スケーリング（条件数改善）
 
@@ -497,6 +537,46 @@ $$
 - 各 rank のグラフは独立したサンプルとして扱われます
 - 正規化統計量（平均・標準偏差）は全 rank のデータから計算されます
 - 各エポックで全ての (time, rank) ケースを用いて損失を計算し、モデルを更新します
+
+## 変更履歴
+
+### 2025-12-22: PDE損失の改善とモデルアーキテクチャ更新
+
+#### バグ修正
+- **val評価での対角スケーリング不整合を修正**: Final diagnostics (val) でも train と同じ対角スケーリングを適用するように修正
+
+#### パフォーマンス改善
+- **apply_diagonal_scaling_csr() のベクトル化**: Pythonループを NumPy のベクトル化演算に置き換え（10-100倍高速化）
+- **matvec_csr_numpy() の高速化**: scipy.sparse.csr_matrix を使用（数十倍高速化）
+- **validation 評価コードの重複削除**: `evaluate_validation_cases()` 共通関数を作成（約140行削減）
+- **不要な empty_cache() 呼び出しを削除**: 学習ループ内での呼び出しを削除
+
+#### PDE 損失の安定化
+- **安定した残差正規化**: `||r||² / (||Ax||² + ||b||² + eps)` または行ごと正規化
+- **行ごとスケーリング（Jacobi的前処理）**: 対角成分で残差を正規化し、勾配のバランスを改善
+- **EPS_RES を 1e-12 から 1e-8 に増加**: 数値安定性を向上
+
+#### ゲージ正則化の改善
+- **セル体積による重み付け**: 物理的に意味のある体積加重平均を使用
+
+#### モデルアーキテクチャの改善
+- **入力射影層の追加**: 残差接続のため入力次元を隠れ次元に射影
+- **LayerNorm の追加**: 各畳み込み層の後に正規化を適用
+- **残差接続（Skip connections）の追加**: 勾配の流れを改善
+
+#### 学習の安定化
+- **勾配クリッピング**: `USE_GRAD_CLIP = True` で勾配ノルムをクリップ
+- **学習率ウォームアップ**: `USE_LR_WARMUP = True` で学習初期に学習率を徐々に増加
+
+#### デフォルト値の調整
+- **LAMBDA_PDE**: 0.0001 → 1.0（教師なし学習でのPDE損失の重要性を反映）
+- **Optuna 探索範囲**: lambda_pde の範囲を 0.01〜10.0 に拡大
+
+#### 教師なし学習の改善
+- **出力スケールの推定**: `b` と対角成分から `x_std` を推定（ダミー値 1.0 の代わり）
+
+#### API 更新
+- **非推奨 PyTorch AMP API の更新**: `torch.cuda.amp.*` → `torch.amp.*`
 
 ## ライセンス
 

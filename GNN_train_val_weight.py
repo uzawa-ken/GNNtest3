@@ -64,6 +64,14 @@ LR_SCHED_FACTOR = 0.5
 LR_SCHED_PATIENCE = 20
 LR_SCHED_MIN_LR = 1e-6
 
+# 学習率ウォームアップ
+USE_LR_WARMUP = True
+LR_WARMUP_EPOCHS = 10  # ウォームアップするエポック数
+
+# 勾配クリッピング
+USE_GRAD_CLIP = True
+GRAD_CLIP_MAX_NORM = 1.0  # 勾配ノルムの最大値
+
 # メモリ効率化オプション
 USE_LAZY_LOADING = True   # データをCPUに保持し、使用時のみGPUへ転送
 USE_AMP = True            # 混合精度学習（Automatic Mixed Precision）を有効化
@@ -73,15 +81,16 @@ USE_DATA_CACHE = True     # データをキャッシュファイルに保存し�
 CACHE_DIR = ".cache"      # キャッシュファイルの保存先ディレクトリ
 
 LAMBDA_DATA = 0.1
-LAMBDA_PDE  = 0.0001
-LAMBDA_GAUGE = 0.01  # ゲージ正則化係数（教師なし学習時の定数モード抑制用）
+LAMBDA_PDE  = 1.0         # PDE損失の重み（教師なし学習では主要な学習信号）
+LAMBDA_GAUGE = 0.01       # ゲージ正則化係数（教師なし学習時の定数モード抑制用）
 
 W_PDE_MAX = 10.0  # w_pde の最大値
 USE_MESH_QUALITY_WEIGHTS = True  # メッシュ品質重みを使用（Falseで全セル等重み w=1）
 USE_DIAGONAL_SCALING = True  # 対角スケーリングを適用（条件数改善のため）
+USE_ROW_NORMALIZATION = True  # 残差の行ごと正規化を適用（勾配バランス改善）
 
 EPS_DATA = 1e-12  # データ損失用 eps
-EPS_RES  = 1e-12  # 残差正規化用 eps
+EPS_RES  = 1e-8   # 残差正規化用 eps（安定性のため大きめに設定）
 EPS_PLOT = 1e-12  # ★ログプロット用の下限値
 
 RANDOM_SEED = 42  # train/val をランダム分割するためのシード
@@ -520,19 +529,45 @@ def load_case_with_csr(gnn_dir: str, time_str: str, rank_str: str):
 # ------------------------------------------------------------
 
 class SimpleSAGE(nn.Module):
+    """
+    改善版 GraphSAGE モデル。
+    - LayerNorm による正規化
+    - 残差接続（Skip connections）
+    - 入力射影層（入力次元を隠れ次元に合わせる）
+    """
     def __init__(self, in_channels: int, hidden_channels: int = 64, num_layers: int = 4):
         super().__init__()
+        self.num_layers = num_layers
+
+        # 入力射影層（残差接続のため）
+        self.input_proj = nn.Linear(in_channels, hidden_channels)
+
+        # GraphSAGE 畳み込み層
         self.convs = nn.ModuleList()
-        self.convs.append(SAGEConv(in_channels, hidden_channels))
-        for _ in range(num_layers - 2):
+        self.norms = nn.ModuleList()
+
+        for i in range(num_layers - 1):
             self.convs.append(SAGEConv(hidden_channels, hidden_channels))
+            self.norms.append(nn.LayerNorm(hidden_channels))
+
+        # 出力層
         self.convs.append(SAGEConv(hidden_channels, 1))
 
     def forward(self, x, edge_index):
-        for i, conv in enumerate(self.convs):
+        # 入力射影
+        x = self.input_proj(x)
+        x = F.relu(x)
+
+        # 中間層（残差接続 + LayerNorm）
+        for i, (conv, norm) in enumerate(zip(self.convs[:-1], self.norms)):
+            x_res = x  # 残差接続用に保存
             x = conv(x, edge_index)
-            if i != len(self.convs) - 1:
-                x = F.relu(x)
+            x = norm(x)
+            x = F.relu(x)
+            x = x + x_res  # 残差接続
+
+        # 出力層（活性化なし）
+        x = self.convs[-1](x, edge_index)
         return x.view(-1)
 
 # ------------------------------------------------------------
@@ -807,6 +842,13 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
     else:
         diag_sqrt = None
 
+    # セル体積（ゲージ正則化用）
+    volume_np = feats_np[:, 9].copy()
+    volume = torch.from_numpy(volume_np).float().to(target_device)
+
+    # 対角成分（行ごと正規化用）
+    diag = torch.from_numpy(diag_np).float().to(target_device)
+
     return {
         "time": rc["time"],
         "rank": rc["rank"],
@@ -826,6 +868,8 @@ def convert_raw_case_to_torch_case(rc, feat_mean, feat_std, x_mean, x_std, devic
         "diag_sqrt": diag_sqrt,  # ★ 対角スケーリングの逆変換用
         "diag_sqrt_np": diag_sqrt_np,  # ★ NumPy版も保持
         "use_diagonal_scaling": use_diagonal_scaling,  # スケーリング適用フラグ
+        "volume": volume,  # ★ セル体積（ゲージ正則化用）
+        "diag": diag,  # ★ 対角成分（行ごと正規化用）
 
         # ★ 誤差場可視化用に元の座標・品質指標も持たせる
         "coords_np": feats_np[:, 0:3].copy(),   # [x, y, z]
@@ -866,6 +910,8 @@ def move_case_to_device(cs, device):
         "diag_sqrt": diag_sqrt.to(device, non_blocking=True) if diag_sqrt is not None else None,
         "diag_sqrt_np": cs.get("diag_sqrt_np"),
         "use_diagonal_scaling": cs.get("use_diagonal_scaling", False),
+        "volume": cs["volume"].to(device, non_blocking=True),  # ★ セル体積
+        "diag": cs["diag"].to(device, non_blocking=True),  # ★ 対角成分
         "coords_np": cs["coords_np"],
         "skew_np": cs["skew_np"],
         "non_ortho_np": cs["non_ortho_np"],
@@ -1341,10 +1387,21 @@ def train_gnn_auto_trainval_pde_weighted(
             f"min={all_xtrue.min():.3e}, max={all_xtrue.max():.3e}, mean={x_mean:.3e}"
         )
     else:
-        # 教師なし学習の場合、ダミー値を設定
+        # 教師なし学習の場合、b と対角成分から出力スケールを推定
+        # 次元解析: Ax = b より、x のスケールは ||b|| / ||diag|| 程度
+        all_b = np.concatenate([rc["b_np"] for rc in raw_cases_train], axis=0)
+        all_diag = np.concatenate([rc["feats_np"][:, 3] for rc in raw_cases_train], axis=0)
+
+        b_rms = np.sqrt(np.mean(all_b**2)) + 1e-12
+        diag_rms = np.sqrt(np.mean(all_diag**2)) + 1e-12
+
+        # x のスケールを推定（ゲージ正則化で平均は 0 に近づくと仮定）
         x_mean = 0.0
-        x_std  = 1.0
-        log_print("[INFO] x_true 統計: 教師なし学習モードのためダミー値 (mean=0, std=1)")
+        x_std = b_rms / diag_rms
+        log_print(
+            f"[INFO] x_true 統計: 教師なし学習モード（b と diag から推定）"
+            f" mean={x_mean:.3e}, std={x_std:.3e} (b_rms={b_rms:.3e}, diag_rms={diag_rms:.3e})"
+        )
 
     x_mean_t = torch.tensor(x_mean, dtype=torch.float32, device=device)
     x_std_t  = torch.tensor(x_std,  dtype=torch.float32, device=device)
@@ -1525,6 +1582,12 @@ def train_gnn_auto_trainval_pde_weighted(
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
+        # 学習率ウォームアップ
+        if USE_LR_WARMUP and epoch <= LR_WARMUP_EPOCHS:
+            warmup_factor = epoch / LR_WARMUP_EPOCHS
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = LR * warmup_factor
+
         total_data_loss = 0.0
         total_pde_loss  = 0.0
         total_gauge_loss = 0.0
@@ -1553,6 +1616,8 @@ def train_gnn_auto_trainval_pde_weighted(
             has_x_true  = cs_gpu.get("has_x_true", x_true is not None)
             diag_sqrt   = cs_gpu.get("diag_sqrt", None)
             use_dscale  = cs_gpu.get("use_diagonal_scaling", False) and (diag_sqrt is not None)
+            volume      = cs_gpu["volume"]  # セル体積（ゲージ正則化用）
+            diag        = cs_gpu["diag"]    # 対角成分（行ごと正規化用）
 
 
             # AMP: autocast で順伝播と損失計算を FP16/BF16 で実行
@@ -1583,24 +1648,42 @@ def train_gnn_auto_trainval_pde_weighted(
                     # 教師なし学習: データ損失は 0
                     data_loss_case = None
 
-                # PDE 損失: w_pde 付き残差ノルム ||sqrt(w) * (Ax - b)||_2
+                # PDE 損失: 安定した正規化方式
                 # 対角スケーリング有効時は、A_scaled x_scaled = b_scaled を評価
                 x_for_pde = (x_pred * diag_sqrt) if use_dscale else x_pred
                 Ax = matvec_csr_torch(row_ptr, col_ind, vals, row_idx, x_for_pde)
                 r  = Ax - b
 
-                sqrt_w = torch.sqrt(w_pde)
-                wr = sqrt_w * r
-                wb = sqrt_w * b
-                norm_wr = torch.norm(wr)
-                norm_wb = torch.norm(wb) + EPS_RES
-                R_pred = norm_wr / norm_wb  # 診断用の相対残差（損失には使用しない）
-                pde_loss_case = R_pred * R_pred
-                # ゲージ損失: x_pred の平均値の二乗（教師なし学習時の定数モード抑制用）
+                # 行ごと正規化（対角成分でスケール）
+                if USE_ROW_NORMALIZATION:
+                    diag_abs = torch.abs(diag) + EPS_RES
+                    r_normalized = r / diag_abs
+                    sqrt_w = torch.sqrt(w_pde)
+                    wr = sqrt_w * r_normalized
+                    # 正規化された残差の二乗平均
+                    pde_loss_case = torch.mean(wr * wr)
+                else:
+                    sqrt_w = torch.sqrt(w_pde)
+                    wr = sqrt_w * r
+                    wAx = sqrt_w * Ax
+                    wb = sqrt_w * b
+                    norm_wr = torch.norm(wr)
+                    # 安定した正規化: ||r||² / (||Ax||² + ||b||² + eps)
+                    norm_scale = torch.sqrt(torch.norm(wAx)**2 + torch.norm(wb)**2) + EPS_RES
+                    pde_loss_case = (norm_wr / norm_scale) ** 2
+
+                # 診断用の相対残差（ログ出力用）
+                with torch.no_grad():
+                    norm_wr_diag = torch.norm(sqrt_w * r)
+                    norm_wb_diag = torch.norm(sqrt_w * b) + EPS_RES
+                    R_pred = norm_wr_diag / norm_wb_diag
+
+                # ゲージ損失: セル体積で重み付けした平均値の二乗（物理的に意味のある平均）
                 # 圧力ポアソン方程式の解は定数の不定性（ゲージ自由度）があるため、
-                # 平均ゼロに近づけることで解を一意に定める
-                # ゲージ正則化は「物理スケール x」の定数モード抑制として維持
-                gauge_loss_case = torch.mean(x_pred) ** 2
+                # 体積加重平均をゼロに近づけることで解を一意に定める
+                total_volume = torch.sum(volume) + EPS_RES
+                weighted_mean = torch.sum(x_pred * volume) / total_volume
+                gauge_loss_case = weighted_mean ** 2
 
             # ---- 目的関数（平均化を保ったまま、ケースごとに backward して勾配蓄積）----
             loss_case = (LAMBDA_PDE / num_train) * pde_loss_case + (LAMBDA_GAUGE / num_train) * gauge_loss_case
@@ -1634,6 +1717,11 @@ def train_gnn_auto_trainval_pde_weighted(
             # 遅延ロードの場合、参照を外す（empty_cache は通常不要・逆に遅くなる）
             if USE_LAZY_LOADING:
                 del cs_gpu
+
+        # 勾配クリッピング
+        if USE_GRAD_CLIP:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
 
         scaler.step(optimizer)
         scaler.update()
