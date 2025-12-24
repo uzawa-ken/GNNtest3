@@ -438,10 +438,12 @@ def main() -> None:
     gnn.RANDOM_SEED     = args.random_seed
 
     # ベストトライアルのハイパーパラメータを gnn 側に反映
+    # lambda_data, lambda_pde は固定値の場合は best.params に含まれないため、
+    # .get() でデフォルト値（args で指定した固定値）を使用
     gnn.LR              = best.params["lr"]
     gnn.WEIGHT_DECAY    = best.params["weight_decay"]
-    gnn.LAMBDA_DATA     = best.params["lambda_data"]
-    gnn.LAMBDA_PDE      = best.params["lambda_pde"]
+    gnn.LAMBDA_DATA     = best.params.get("lambda_data", args.lambda_data_min)
+    gnn.LAMBDA_PDE      = best.params.get("lambda_pde", args.lambda_pde_min)
     gnn.HIDDEN_CHANNELS = best.params["hidden_channels"]
     gnn.NUM_LAYERS      = best.params["num_layers"]
 
