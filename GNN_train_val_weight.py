@@ -1021,8 +1021,9 @@ def save_error_field_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
     さらに |誤差| と w_pde の簡単な統計（相関係数、誤差上位5%セルの平均w_pde など）をログ出力する。
     """
     # ---- Torch -> NumPy ----
-    x_pred_np = x_pred.detach().cpu().numpy().reshape(-1)
-    x_true_np = x_true.detach().cpu().numpy().reshape(-1)
+    # AMP使用時にfloat16になることがあるため、float32に変換
+    x_pred_np = x_pred.detach().cpu().float().numpy().reshape(-1)
+    x_true_np = x_true.detach().cpu().float().numpy().reshape(-1)
     err       = x_pred_np - x_true_np
     abs_err   = np.abs(err)
 
@@ -1192,8 +1193,9 @@ def save_pressure_comparison_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT
     import warnings
 
     # ---- Torch -> NumPy ----
-    x_pred_np = x_pred.detach().cpu().numpy().reshape(-1)
-    x_true_np = x_true.detach().cpu().numpy().reshape(-1)
+    # AMP使用時にfloat16になることがあるため、float32に変換
+    x_pred_np = x_pred.detach().cpu().float().numpy().reshape(-1)
+    x_true_np = x_true.detach().cpu().float().numpy().reshape(-1)
 
     # ゲージ補正（平均を揃える）
     x_pred_centered = x_pred_np - np.mean(x_pred_np)
