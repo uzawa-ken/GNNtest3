@@ -1143,6 +1143,43 @@ def save_error_field_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
         )
 
 
+def write_vtk_polydata(filepath, coords, scalars_dict):
+    """
+    VTK Legacy形式（POLYDATA）でポイントデータを出力する。
+
+    Args:
+        filepath: 出力ファイルパス（.vtk）
+        coords: 座標配列 (N, 3)
+        scalars_dict: スカラーデータの辞書 {"name": array, ...}
+    """
+    n_points = coords.shape[0]
+
+    with open(filepath, "w") as f:
+        # ヘッダー
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write("Pressure field data\n")
+        f.write("ASCII\n")
+        f.write("DATASET POLYDATA\n")
+
+        # 座標データ
+        f.write(f"POINTS {n_points} float\n")
+        for i in range(n_points):
+            f.write(f"{coords[i, 0]:.9e} {coords[i, 1]:.9e} {coords[i, 2]:.9e}\n")
+
+        # 頂点定義（各点を独立した頂点として扱う）
+        f.write(f"VERTICES {n_points} {n_points * 2}\n")
+        for i in range(n_points):
+            f.write(f"1 {i}\n")
+
+        # スカラーデータ
+        f.write(f"POINT_DATA {n_points}\n")
+        for name, data in scalars_dict.items():
+            f.write(f"SCALARS {name} float 1\n")
+            f.write("LOOKUP_TABLE default\n")
+            for val in data:
+                f.write(f"{val:.9e}\n")
+
+
 def save_pressure_comparison_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
     """
     圧力場の真値と予測値を比較する2D可視化を保存する。
@@ -2187,33 +2224,32 @@ def train_gnn_auto_trainval_pde_weighted(
                 f.write(f"{i} {val:.9e}\n")
         log_print(f"    [INFO] train x_pred を {out_path} に書き出しました。")
 
-        # 3次元比較用CSV出力（座標付き）
+        # 3次元可視化用VTK出力（座標付き）
         coords_np = cs["coords_np"]  # (N, 3): x, y, z
-        csv_pred_path = os.path.join(OUTPUT_DIR, f"pressure_pred_train_{time_str}_rank{rank_str}.csv")
-        with open(csv_pred_path, "w") as f:
-            f.write("x,y,z,p_pred\n")
-            for i in range(len(x_pred_np)):
-                f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_pred_np[i]:.9e}\n")
-        log_print(f"    [INFO] 予測値CSV を {csv_pred_path} に書き出しました。")
 
-        # 真値がある場合は真値CSVも出力
+        # 予測値のみのVTKファイル
+        vtk_pred_path = os.path.join(OUTPUT_DIR, f"pressure_pred_train_{time_str}_rank{rank_str}.vtk")
+        write_vtk_polydata(vtk_pred_path, coords_np, {"p_pred": x_pred_np})
+        log_print(f"    [INFO] 予測値VTK を {vtk_pred_path} に書き出しました。")
+
+        # 真値がある場合は真値VTKと比較用VTKも出力
         if has_x_true and x_true is not None:
             x_true_np = x_true.cpu().numpy().reshape(-1)
-            csv_true_path = os.path.join(OUTPUT_DIR, f"pressure_true_train_{time_str}_rank{rank_str}.csv")
-            with open(csv_true_path, "w") as f:
-                f.write("x,y,z,p_true\n")
-                for i in range(len(x_true_np)):
-                    f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_true_np[i]:.9e}\n")
-            log_print(f"    [INFO] 真値CSV を {csv_true_path} に書き出しました。")
 
-            # 真値と予測値を並べた比較用CSV
-            csv_compare_path = os.path.join(OUTPUT_DIR, f"pressure_compare_train_{time_str}_rank{rank_str}.csv")
-            with open(csv_compare_path, "w") as f:
-                f.write("x,y,z,p_true,p_pred,error\n")
-                for i in range(len(x_pred_np)):
-                    error = x_pred_np[i] - x_true_np[i]
-                    f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_true_np[i]:.9e},{x_pred_np[i]:.9e},{error:.9e}\n")
-            log_print(f"    [INFO] 比較CSV を {csv_compare_path} に書き出しました。")
+            # 真値のみのVTKファイル
+            vtk_true_path = os.path.join(OUTPUT_DIR, f"pressure_true_train_{time_str}_rank{rank_str}.vtk")
+            write_vtk_polydata(vtk_true_path, coords_np, {"p_true": x_true_np})
+            log_print(f"    [INFO] 真値VTK を {vtk_true_path} に書き出しました。")
+
+            # 真値・予測値・誤差を含む比較用VTKファイル
+            error_np = x_pred_np - x_true_np
+            vtk_compare_path = os.path.join(OUTPUT_DIR, f"pressure_compare_train_{time_str}_rank{rank_str}.vtk")
+            write_vtk_polydata(vtk_compare_path, coords_np, {
+                "p_true": x_true_np,
+                "p_pred": x_pred_np,
+                "error": error_np
+            })
+            log_print(f"    [INFO] 比較VTK を {vtk_compare_path} に書き出しました。")
 
         # ★ 誤差場の可視化（train ケース、x_true がある場合のみ）
         if enable_error_plots and has_x_true and x_true is not None and num_error_plots_train < MAX_ERROR_PLOT_CASES_TRAIN:
@@ -2365,33 +2401,32 @@ def train_gnn_auto_trainval_pde_weighted(
                     f.write(f"{i} {val:.9e}\n")
             log_print(f"    [INFO] val x_pred を {out_path} に書き出しました。")
 
-            # 3次元比較用CSV出力（座標付き）
+            # 3次元可視化用VTK出力（座標付き）
             coords_np = cs["coords_np"]  # (N, 3): x, y, z
-            csv_pred_path = os.path.join(OUTPUT_DIR, f"pressure_pred_val_{time_str}_rank{rank_str}.csv")
-            with open(csv_pred_path, "w") as f:
-                f.write("x,y,z,p_pred\n")
-                for i in range(len(x_pred_np)):
-                    f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_pred_np[i]:.9e}\n")
-            log_print(f"    [INFO] 予測値CSV を {csv_pred_path} に書き出しました。")
 
-            # 真値がある場合は真値CSVも出力
+            # 予測値のみのVTKファイル
+            vtk_pred_path = os.path.join(OUTPUT_DIR, f"pressure_pred_val_{time_str}_rank{rank_str}.vtk")
+            write_vtk_polydata(vtk_pred_path, coords_np, {"p_pred": x_pred_np})
+            log_print(f"    [INFO] 予測値VTK を {vtk_pred_path} に書き出しました。")
+
+            # 真値がある場合は真値VTKと比較用VTKも出力
             if has_x_true and x_true is not None:
                 x_true_np = x_true.cpu().numpy().reshape(-1)
-                csv_true_path = os.path.join(OUTPUT_DIR, f"pressure_true_val_{time_str}_rank{rank_str}.csv")
-                with open(csv_true_path, "w") as f:
-                    f.write("x,y,z,p_true\n")
-                    for i in range(len(x_true_np)):
-                        f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_true_np[i]:.9e}\n")
-                log_print(f"    [INFO] 真値CSV を {csv_true_path} に書き出しました。")
 
-                # 真値と予測値を並べた比較用CSV
-                csv_compare_path = os.path.join(OUTPUT_DIR, f"pressure_compare_val_{time_str}_rank{rank_str}.csv")
-                with open(csv_compare_path, "w") as f:
-                    f.write("x,y,z,p_true,p_pred,error\n")
-                    for i in range(len(x_pred_np)):
-                        error = x_pred_np[i] - x_true_np[i]
-                        f.write(f"{coords_np[i, 0]:.9e},{coords_np[i, 1]:.9e},{coords_np[i, 2]:.9e},{x_true_np[i]:.9e},{x_pred_np[i]:.9e},{error:.9e}\n")
-                log_print(f"    [INFO] 比較CSV を {csv_compare_path} に書き出しました。")
+                # 真値のみのVTKファイル
+                vtk_true_path = os.path.join(OUTPUT_DIR, f"pressure_true_val_{time_str}_rank{rank_str}.vtk")
+                write_vtk_polydata(vtk_true_path, coords_np, {"p_true": x_true_np})
+                log_print(f"    [INFO] 真値VTK を {vtk_true_path} に書き出しました。")
+
+                # 真値・予測値・誤差を含む比較用VTKファイル
+                error_np = x_pred_np - x_true_np
+                vtk_compare_path = os.path.join(OUTPUT_DIR, f"pressure_compare_val_{time_str}_rank{rank_str}.vtk")
+                write_vtk_polydata(vtk_compare_path, coords_np, {
+                    "p_true": x_true_np,
+                    "p_pred": x_pred_np,
+                    "error": error_np
+                })
+                log_print(f"    [INFO] 比較VTK を {vtk_compare_path} に書き出しました。")
 
             # ★ 誤差場の可視化（val ケース、x_true がある場合のみ）
             if enable_error_plots and has_x_true and x_true is not None and num_error_plots_val < MAX_ERROR_PLOT_CASES_VAL:
