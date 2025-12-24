@@ -363,6 +363,36 @@ def main() -> None:
         default=10.0,
         help="lambda_pde の探索上限（デフォルト: 10.0）",
     )
+    # アーリーストッピング
+    parser.add_argument(
+        "--early_stopping",
+        action="store_true",
+        default=True,
+        help="アーリーストッピングを有効化（デフォルト: 有効）",
+    )
+    parser.add_argument(
+        "--no_early_stopping",
+        action="store_true",
+        help="アーリーストッピングを無効化",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=50,
+        help="アーリーストッピングの patience（デフォルト: 50）",
+    )
+    # OneCycleLR
+    parser.add_argument(
+        "--use_one_cycle_lr",
+        action="store_true",
+        help="OneCycleLR スケジューラを使用（高速収束用）",
+    )
+    parser.add_argument(
+        "--one_cycle_max_lr",
+        type=float,
+        default=1e-2,
+        help="OneCycleLR の最大学習率（デフォルト: 1e-2）",
+    )
 
     args = parser.parse_args()
 
@@ -379,6 +409,16 @@ def main() -> None:
 
     # 対角スケーリングオプションの設定
     gnn.USE_DIAGONAL_SCALING = not args.no_diagonal_scaling
+
+    # アーリーストッピングの設定
+    gnn.USE_EARLY_STOPPING = not args.no_early_stopping
+    gnn.EARLY_STOPPING_PATIENCE = args.early_stopping_patience
+
+    # OneCycleLR の設定
+    gnn.USE_ONE_CYCLE_LR = args.use_one_cycle_lr
+    gnn.ONE_CYCLE_MAX_LR = args.one_cycle_max_lr
+    if args.use_one_cycle_lr:
+        gnn.USE_LR_SCHEDULER = False  # ReduceLROnPlateau を無効化
 
     sampler = optuna.samplers.TPESampler(seed=args.random_seed)
     study = optuna.create_study(direction="minimize", sampler=sampler)

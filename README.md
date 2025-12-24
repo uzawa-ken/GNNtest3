@@ -154,6 +154,16 @@ LR_SCHED_FACTOR = 0.5          # 学習率を何倍に下げるか
 LR_SCHED_PATIENCE = 20         # 何エポック改善が無ければ下げるか
 LR_SCHED_MIN_LR = 1e-6         # 学習率の下限
 
+# OneCycleLR スケジューラ（高速収束用、USE_LR_SCHEDULER=False の場合のみ有効）
+USE_ONE_CYCLE_LR = False       # True にすると ReduceLROnPlateau の代わりに OneCycleLR を使用
+ONE_CYCLE_MAX_LR = 1e-2        # OneCycleLR の最大学習率（LR の 10 倍程度が目安）
+ONE_CYCLE_PCT_START = 0.3      # 学習率を上げるフェーズの割合
+
+# アーリーストッピング
+USE_EARLY_STOPPING = True      # 検証誤差が改善しなくなったら学習を終了
+EARLY_STOPPING_PATIENCE = 50   # 改善がない場合に待つエポック数
+EARLY_STOPPING_MIN_DELTA = 1e-6  # 改善とみなす最小変化量（相対値）
+
 # 学習率ウォームアップ
 USE_LR_WARMUP = True           # 学習初期に学習率を徐々に上げる
 LR_WARMUP_EPOCHS = 10          # ウォームアップするエポック数
@@ -622,6 +632,34 @@ LOOKUP_TABLE default
 - 各エポックで全ての (time, rank) ケースを用いて損失を計算し、モデルを更新します
 
 ## 変更履歴
+
+### 2025-12-24: アーリーストッピングと収束高速化
+
+#### アーリーストッピング
+- **`USE_EARLY_STOPPING`**: 検証誤差が改善しなくなったら学習を自動終了
+- **`EARLY_STOPPING_PATIENCE`**: 改善がない場合に待つエポック数（デフォルト: 50）
+- **ベストモデルの自動復元**: 終了時に最良の検証誤差を達成したモデルを復元
+- **相対的改善判定**: `EARLY_STOPPING_MIN_DELTA` で改善とみなす最小変化量を設定
+
+#### OneCycleLR スケジューラ
+- **`USE_ONE_CYCLE_LR`**: ReduceLROnPlateau の代わりに OneCycleLR を使用
+- **高速収束**: 学習率を一度大きく上げてから下げることで収束を高速化
+- **`ONE_CYCLE_MAX_LR`**: 最大学習率（デフォルト: 1e-2、初期学習率の 10 倍程度が目安）
+- **`ONE_CYCLE_PCT_START`**: 学習率を上げるフェーズの割合（デフォルト: 0.3）
+
+#### VTK出力形式への変更
+- **CSV から VTK 形式に変更**: ParaView で直接読み込み可能
+- **`pressure_compare_*.vtk`**: 真値・予測値・誤差を1ファイルに含む
+
+#### Optuna スクリプトへの機能追加
+- **`--early_stopping`/`--no_early_stopping`**: アーリーストッピングの有効/無効
+- **`--early_stopping_patience`**: patience の設定
+- **`--use_one_cycle_lr`**: OneCycleLR の使用
+- **`--one_cycle_max_lr`**: OneCycleLR の最大学習率
+
+#### バグ修正
+- **float16 エラーを修正**: AMP 使用時の numpy linalg 操作エラーを修正
+- **KeyError 修正**: lambda_data/lambda_pde が固定値の場合の Optuna エラーを修正
 
 ### 2025-12-23: PDE損失正規化の修正と可視化機能の追加
 

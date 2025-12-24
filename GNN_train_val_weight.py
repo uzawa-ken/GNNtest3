@@ -64,6 +64,16 @@ LR_SCHED_FACTOR = 0.5
 LR_SCHED_PATIENCE = 20
 LR_SCHED_MIN_LR = 1e-6
 
+# OneCycleLR スケジューラ（高速収束用、USE_LR_SCHEDULER=False の場合のみ有効）
+USE_ONE_CYCLE_LR = False  # True にすると ReduceLROnPlateau の代わりに OneCycleLR を使用
+ONE_CYCLE_MAX_LR = 1e-2   # OneCycleLR の最大学習率（LR の 10 倍程度が目安）
+ONE_CYCLE_PCT_START = 0.3  # 学習率を上げるフェーズの割合（0.3 = 最初の 30% で上昇）
+
+# アーリーストッピング
+USE_EARLY_STOPPING = True   # 検証誤差が改善しなくなったら学習を終了
+EARLY_STOPPING_PATIENCE = 50  # 改善がない場合に待つエポック数
+EARLY_STOPPING_MIN_DELTA = 1e-6  # 改善とみなす最小変化量（相対値）
+
 # 学習率ウォームアップ
 USE_LR_WARMUP = True
 LR_WARMUP_EPOCHS = 10  # ウォームアップするエポック数
@@ -1738,7 +1748,21 @@ def train_gnn_auto_trainval_pde_weighted(
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = None
-    if USE_LR_SCHEDULER:
+    scheduler_type = None  # "plateau" or "onecycle"
+    if USE_ONE_CYCLE_LR:
+        # OneCycleLR: 高速収束のための学習率スケジューラ
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=ONE_CYCLE_MAX_LR,
+            total_steps=NUM_EPOCHS,
+            pct_start=ONE_CYCLE_PCT_START,
+            anneal_strategy='cos',
+            div_factor=ONE_CYCLE_MAX_LR / LR,  # 初期学習率 = max_lr / div_factor = LR
+            final_div_factor=1e4,  # 最終学習率 = max_lr / final_div_factor
+        )
+        scheduler_type = "onecycle"
+        log_print(f"[INFO] OneCycleLR スケジューラが有効です (max_lr={ONE_CYCLE_MAX_LR})")
+    elif USE_LR_SCHEDULER:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
@@ -1747,6 +1771,7 @@ def train_gnn_auto_trainval_pde_weighted(
             min_lr=LR_SCHED_MIN_LR,
             verbose=False,
         )
+        scheduler_type = "plateau"
 
     # --- AMP (混合精度学習) の設定 ---
     use_amp_actual = USE_AMP and device.type == "cuda"
@@ -1787,6 +1812,15 @@ def train_gnn_auto_trainval_pde_weighted(
         "rel_err_train": [],
         "rel_err_val": [],  # val が無いときは None
     }
+
+    # --- アーリーストッピング用変数 ---
+    best_val_metric = float('inf')
+    best_epoch = 0
+    best_model_state = None
+    epochs_without_improvement = 0
+
+    if USE_EARLY_STOPPING:
+        log_print(f"[INFO] アーリーストッピングが有効です (patience={EARLY_STOPPING_PATIENCE})")
 
     # --- 学習ループ ---
     for epoch in range(1, NUM_EPOCHS + 1):
@@ -1983,18 +2017,57 @@ def train_gnn_auto_trainval_pde_weighted(
         avg_R_pred_val = None
         avg_rmse_val = None
 
-        # スケジューラ用・ロギング用に検証誤差を計算（必要なときのみ）
-        need_val_eval = num_val > 0 and (scheduler is not None or epoch % PLOT_INTERVAL == 0)
+        # スケジューラ用・ロギング用・アーリーストッピング用に検証誤差を計算
+        need_val_eval = num_val > 0 and (
+            scheduler_type == "plateau" or
+            USE_EARLY_STOPPING or
+            epoch % PLOT_INTERVAL == 0
+        )
         if need_val_eval:
             model.eval()
             avg_rel_err_val, avg_rmse_val, avg_R_pred_val, _ = evaluate_validation_cases(
                 model, cases_val, device, x_std_t, x_mean_t, use_amp_actual
             )
 
-        # 学習率スケジューラを更新（検証誤差があればそれを監視）
+        # 学習率スケジューラを更新
         if scheduler is not None:
-            metric_for_scheduler = avg_rel_err_val if avg_rel_err_val is not None else float(loss_value)
-            scheduler.step(metric_for_scheduler)
+            if scheduler_type == "onecycle":
+                # OneCycleLR はエポックごとに step() を呼ぶ（メトリクス不要）
+                scheduler.step()
+            else:  # "plateau"
+                # ReduceLROnPlateau は検証誤差を監視
+                metric_for_scheduler = avg_rel_err_val if avg_rel_err_val is not None else float(loss_value)
+                scheduler.step(metric_for_scheduler)
+
+        # --- アーリーストッピングのチェック ---
+        if USE_EARLY_STOPPING:
+            # 監視するメトリクス（検証誤差があればそれ、なければ訓練損失）
+            current_metric = avg_rel_err_val if avg_rel_err_val is not None else float(loss_value)
+
+            # 改善判定（相対的な改善量で判断）
+            if best_val_metric == float('inf'):
+                is_improvement = True
+            else:
+                relative_improvement = (best_val_metric - current_metric) / (best_val_metric + 1e-12)
+                is_improvement = relative_improvement > EARLY_STOPPING_MIN_DELTA
+
+            if is_improvement:
+                best_val_metric = current_metric
+                best_epoch = epoch
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            # 打ち切り判定
+            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+                log_print(f"\n[EARLY STOPPING] {EARLY_STOPPING_PATIENCE} エポック改善なし。"
+                         f"ベストエポック: {best_epoch} (metric={best_val_metric:.4e})")
+                # ベストモデルを復元
+                if best_model_state is not None:
+                    model.load_state_dict(best_model_state)
+                    log_print(f"[INFO] ベストモデル (epoch={best_epoch}) を復元しました。")
+                break
 
 
         # --- ロギング（train + val） ---
