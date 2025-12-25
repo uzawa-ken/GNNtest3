@@ -578,10 +578,6 @@ $$
 | `pressure_true_val_{time}_rank{N}.vtk` | 検証データの真値圧力（座標付きVTK） |
 | `pressure_compare_train_{time}_rank{N}.vtk` | 真値・予測値・誤差の比較（座標付きVTK） |
 | `pressure_compare_val_{time}_rank{N}.vtk` | 検証データの比較（座標付きVTK） |
-| `pressure_comparison_{prefix}.png` | 2D断面での圧力場比較（真値、予測値、差分） |
-| `scatter_comparison_{prefix}.png` | 散布図（真値 vs 予測値）と誤差ヒストグラム |
-| `error3d_{prefix}.png` | 誤差場の3D散布図 |
-| `error2d_yMid_{prefix}.png` | 誤差場とメッシュ品質重みの2Dカラーマップ |
 
 ### VTK ファイル形式（3次元可視化用）
 
@@ -650,6 +646,7 @@ LOOKUP_TABLE default
 #### VTK出力形式への変更
 - **CSV から VTK 形式に変更**: ParaView で直接読み込み可能
 - **`pressure_compare_*.vtk`**: 真値・予測値・誤差を1ファイルに含む
+- **PNG可視化を削除**: VTK出力に統一し、コードを簡素化
 
 #### Optuna スクリプトへの機能追加
 - **`--early_stopping`/`--no_early_stopping`**: アーリーストッピングの有効/無効
@@ -661,7 +658,7 @@ LOOKUP_TABLE default
 - **float16 エラーを修正**: AMP 使用時の numpy linalg 操作エラーを修正
 - **KeyError 修正**: lambda_data/lambda_pde が固定値の場合の Optuna エラーを修正
 
-### 2025-12-23: PDE損失正規化の修正と可視化機能の追加
+### 2025-12-23: PDE損失正規化の修正と学習モードの柔軟化
 
 #### PDE損失正規化の修正
 - **`PDE_LOSS_NORMALIZATION` 設定を追加**: 3つの正規化方式から選択可能
@@ -679,12 +676,6 @@ LOOKUP_TABLE default
   - `--lambda_data_min`, `--lambda_data_max`
   - `--lambda_pde_min`, `--lambda_pde_max`
   - 0 を指定して固定値として使用可能
-
-#### 可視化機能の追加
-- **圧力場比較プロット**: 2D断面での真値・予測値・差分の3パネル表示
-- **散布図**: 真値 vs 予測値の散布図（45度線と回帰直線付き）
-- **誤差ヒストグラム**: 予測誤差の分布を可視化
-- **相関係数・RMSE・相対誤差を図中に表示**
 
 ### 2025-12-22: PDE損失の改善とモデルアーキテクチャ更新
 
