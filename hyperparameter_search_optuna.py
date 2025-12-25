@@ -227,7 +227,6 @@ def objective(
         data_dir,
         enable_plot=False,          # 探索中はリアルタイムプロットもオフ
         return_history=True,
-        enable_error_plots=False,   # ★ 探索中は誤差場プロットも完全オフ
     )
 
     # 目的関数として最小検証相対誤差を返す
@@ -487,16 +486,14 @@ def main() -> None:
     gnn.HIDDEN_CHANNELS = best.params["hidden_channels"]
     gnn.NUM_LAYERS      = best.params["num_layers"]
 
-    # ★ この呼び出しだけ誤差場プロットを有効化
-    #   enable_plot はお好みで True/False を選んでください
+    # ベスト設定で最終学習を実行
     gnn.train_gnn_auto_trainval_pde_weighted(
         args.data_dir,
         enable_plot=False,          # 学習曲線のポップアップが不要なら False
         return_history=False,       # ここでは履歴は使わないので False
-        enable_error_plots=True,    # ← ベスト設定のときだけ誤差場 PNG を出力
     )
 
-    print("[INFO] ベスト設定での再学習と誤差場プロット出力が完了しました。")
+    print("[INFO] ベスト設定での再学習が完了しました。VTK出力は output ディレクトリを確認してください。")
 
 
 if __name__ == "__main__":

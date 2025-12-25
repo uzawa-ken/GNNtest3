@@ -112,12 +112,6 @@ RANDOM_SEED = 42  # train/val をランダム分割するためのシード
 # 可視化の更新間隔（エポック）
 PLOT_INTERVAL = 10
 
-# 誤差場可視化用の設定
-MAX_ERROR_PLOT_CASES_TRAIN = 3   # train ケースで誤差図を出す最大件数
-MAX_ERROR_PLOT_CASES_VAL   = 3   # val ケースで誤差図を出す最大件数
-MAX_POINTS_3D_SCATTER      = 50000  # 3D散布図でプロットする最大セル数（それ以上ならランダムサンプリング）
-YSLICE_FRACTIONAL_HALF_WIDTH = 0.05  # y中央断面として扱う帯の半幅（全高さに対する 5%）
-
 # ログファイル用
 LOGGER_FILE = None
 
@@ -1023,137 +1017,6 @@ def evaluate_validation_cases(
     return avg_rel_err_val, avg_rmse_val, avg_R_pred_val, num_val_with_x
 
 
-def save_error_field_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
-    """
-    誤差場 (x_pred - x_true) の 3D 散布図と、
-    y ≒ 中央断面での 2D カラーマップ（誤差 vs w_pde）を保存する。
-
-    さらに |誤差| と w_pde の簡単な統計（相関係数、誤差上位5%セルの平均w_pde など）をログ出力する。
-    """
-    # ---- Torch -> NumPy ----
-    # AMP使用時にfloat16になることがあるため、float32に変換
-    x_pred_np = x_pred.detach().cpu().float().numpy().reshape(-1)
-    x_true_np = x_true.detach().cpu().float().numpy().reshape(-1)
-    err       = x_pred_np - x_true_np
-    abs_err   = np.abs(err)
-
-    coords    = cs["coords_np"]      # (N, 3) : x, y, z
-    w_pde_np  = cs["w_pde_np"]       # (N,)
-
-    N = coords.shape[0]
-    if err.shape[0] != N:
-        log_print(f"    [WARN] 誤差場可視化: 座標数 N={N} と解ベクトル長={err.shape[0]} が一致しません ({prefix})。")
-        return
-
-    # ============================
-    # 1) 3D 散布図 (x, y, z, color = x_pred - x_true)
-    # ============================
-    if N > MAX_POINTS_3D_SCATTER:
-        idx = np.random.choice(N, size=MAX_POINTS_3D_SCATTER, replace=False)
-        log_print(f"    [PLOT] 3D 散布図用に {N} セル中 {idx.size} セルをサンプリングしました ({prefix}).")
-    else:
-        idx = np.arange(N)
-
-    xs = coords[idx, 0]
-    ys = coords[idx, 1]
-    zs = coords[idx, 2]
-    err_sample = err[idx]
-
-    vmax = np.max(np.abs(err_sample)) + 1e-20
-    vmin = -vmax
-
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    sc = ax.scatter(xs, ys, zs, c=err_sample, s=2, cmap="coolwarm", vmin=vmin, vmax=vmax)
-    cbar = fig.colorbar(sc, ax=ax, shrink=0.7)
-    cbar.set_label("x_pred - x_true")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-    ax.set_title(f"誤差場 3D散布図 ({prefix})")
-    fig.tight_layout()
-
-    out3d = os.path.join(output_dir, f"error3d_{prefix}.png")
-    fig.savefig(out3d, dpi=200)
-    plt.close(fig)
-
-    log_print(f"    [PLOT] 誤差場 3D 散布図を {out3d} に保存しました。")
-
-    # ============================
-    # 2) y ≒ 中央断面での 2D カラーマップ
-    #    左: |x_pred - x_true|, 右: w_pde
-    # ============================
-    y = coords[:, 1]
-    y_min, y_max = float(y.min()), float(y.max())
-    if y_max > y_min:
-        y_mid = 0.5 * (y_min + y_max)
-        band  = YSLICE_FRACTIONAL_HALF_WIDTH * (y_max - y_min)
-    else:
-        # 全セル同一 y の場合
-        y_mid = y_min
-        band  = 1e-6
-
-    mask = np.abs(y - y_mid) <= band
-    n_slice = int(np.count_nonzero(mask))
-
-    if n_slice < 10:
-        log_print(f"    [PLOT] y≈中央断面のセル数が {n_slice} と少ないため 2D カラーマップをスキップします ({prefix}).")
-    else:
-        xs2       = coords[mask, 0]
-        zs2       = coords[mask, 2]
-        abs_err2  = abs_err[mask]
-        w_pde2    = w_pde_np[mask]
-
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-        sc0 = axes[0].scatter(xs2, zs2, c=abs_err2, s=5)
-        axes[0].set_aspect("equal", adjustable="box")
-        axes[0].set_xlabel("x")
-        axes[0].set_ylabel("z")
-        axes[0].set_title("誤差場 |x_pred - x_true| (y ≒ 中央断面)")
-        cbar0 = fig.colorbar(sc0, ax=axes[0])
-        cbar0.set_label("|x_pred - x_true|")
-
-        sc1 = axes[1].scatter(xs2, zs2, c=w_pde2, s=5)
-        axes[1].set_aspect("equal", adjustable="box")
-        axes[1].set_xlabel("x")
-        axes[1].set_ylabel("z")
-        axes[1].set_title("w_pde (メッシュ品質重み, y ≒ 中央断面)")
-        cbar1 = fig.colorbar(sc1, ax=axes[1])
-        cbar1.set_label("w_pde")
-
-        fig.tight_layout()
-        out2d = os.path.join(output_dir, f"error2d_yMid_{prefix}.png")
-        fig.savefig(out2d, dpi=200)
-        plt.close(fig)
-
-        log_print(f"    [PLOT] 誤差場と w_pde の 2D カラーマップを {out2d} に保存しました。")
-
-    # ============================
-    # 3) |誤差| と w_pde の簡単な統計
-    # ============================
-    if N >= 10:
-        if np.std(abs_err) > 0.0 and np.std(w_pde_np) > 0.0:
-            corr = float(np.corrcoef(abs_err, w_pde_np)[0, 1])
-        else:
-            corr = float("nan")
-
-        top_frac = 0.05  # 誤差上位5%を見る
-        k = max(1, int(top_frac * N))
-        idx_sorted = np.argsort(-abs_err)  # 大きい順
-        top_idx = idx_sorted[:k]
-
-        mean_w_all = float(w_pde_np.mean())
-        mean_w_top = float(w_pde_np[top_idx].mean())
-
-        log_print(
-            "    [STATS] |誤差| と w_pde の簡易統計: "
-            f"corr(|err|, w_pde)={corr:.3f}, "
-            f"top{int(top_frac*100)}%誤差セルの平均w_pde={mean_w_top:.3e}, "
-            f"全セル平均w_pde={mean_w_all:.3e}"
-        )
-
-
 def write_vtk_polydata(filepath, coords, scalars_dict):
     """
     VTK Legacy形式（POLYDATA）でポイントデータを出力する。
@@ -1189,159 +1052,6 @@ def write_vtk_polydata(filepath, coords, scalars_dict):
             f.write("LOOKUP_TABLE default\n")
             for val in data:
                 f.write(f"{val:.9e}\n")
-
-
-def save_pressure_comparison_plots(cs, x_pred, x_true, prefix, output_dir=OUTPUT_DIR):
-    """
-    圧力場の真値と予測値を比較する2D可視化を保存する。
-
-    出力:
-    1. 2D断面での圧力場比較（真値、予測値、差分の3パネル）
-    2. 散布図（x_true vs x_pred）
-    3. PDE残差のヒストグラム
-    """
-    import warnings
-
-    # ---- Torch -> NumPy ----
-    # AMP使用時にfloat16になることがあるため、float32に変換
-    x_pred_np = x_pred.detach().cpu().float().numpy().reshape(-1)
-    x_true_np = x_true.detach().cpu().float().numpy().reshape(-1)
-
-    # ゲージ補正（平均を揃える）
-    x_pred_centered = x_pred_np - np.mean(x_pred_np)
-    x_true_centered = x_true_np - np.mean(x_true_np)
-    diff = x_pred_centered - x_true_centered
-
-    coords = cs["coords_np"]  # (N, 3): x, y, z
-    N = coords.shape[0]
-
-    if x_pred_np.shape[0] != N:
-        log_print(f"    [WARN] 可視化: 座標数 N={N} と解ベクトル長={x_pred_np.shape[0]} が一致しません ({prefix})。")
-        return
-
-    # ============================
-    # 1) 2D断面での圧力場比較（y ≒ 中央）
-    # ============================
-    y = coords[:, 1]
-    y_min, y_max = float(y.min()), float(y.max())
-    if y_max > y_min:
-        y_mid = 0.5 * (y_min + y_max)
-        band = YSLICE_FRACTIONAL_HALF_WIDTH * (y_max - y_min)
-    else:
-        y_mid = y_min
-        band = 1e-6
-
-    mask = np.abs(y - y_mid) <= band
-    n_slice = int(np.count_nonzero(mask))
-
-    if n_slice >= 10:
-        xs = coords[mask, 0]
-        zs = coords[mask, 2]
-        true_slice = x_true_centered[mask]
-        pred_slice = x_pred_centered[mask]
-        diff_slice = diff[mask]
-
-        # カラースケールを統一
-        vmin_p = min(true_slice.min(), pred_slice.min())
-        vmax_p = max(true_slice.max(), pred_slice.max())
-        vabs_diff = max(abs(diff_slice.min()), abs(diff_slice.max()))
-
-        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-
-        # 真値
-        sc0 = axes[0].scatter(xs, zs, c=true_slice, s=5, cmap="viridis", vmin=vmin_p, vmax=vmax_p)
-        axes[0].set_aspect("equal", adjustable="box")
-        axes[0].set_xlabel("x")
-        axes[0].set_ylabel("z")
-        axes[0].set_title("真値 (x_true, ゲージ補正済み)")
-        fig.colorbar(sc0, ax=axes[0], label="Pressure")
-
-        # 予測値
-        sc1 = axes[1].scatter(xs, zs, c=pred_slice, s=5, cmap="viridis", vmin=vmin_p, vmax=vmax_p)
-        axes[1].set_aspect("equal", adjustable="box")
-        axes[1].set_xlabel("x")
-        axes[1].set_ylabel("z")
-        axes[1].set_title("予測値 (x_pred, ゲージ補正済み)")
-        fig.colorbar(sc1, ax=axes[1], label="Pressure")
-
-        # 差分
-        sc2 = axes[2].scatter(xs, zs, c=diff_slice, s=5, cmap="coolwarm", vmin=-vabs_diff, vmax=vabs_diff)
-        axes[2].set_aspect("equal", adjustable="box")
-        axes[2].set_xlabel("x")
-        axes[2].set_ylabel("z")
-        axes[2].set_title("差分 (x_pred - x_true)")
-        fig.colorbar(sc2, ax=axes[2], label="Difference")
-
-        fig.suptitle(f"圧力場比較 ({prefix}, y≒中央断面, n={n_slice}セル)", fontsize=12)
-        fig.tight_layout()
-
-        out_compare = os.path.join(output_dir, f"pressure_comparison_{prefix}.png")
-        fig.savefig(out_compare, dpi=200)
-        plt.close(fig)
-        log_print(f"    [PLOT] 圧力場比較図を {out_compare} に保存しました。")
-
-    # ============================
-    # 2) 散布図（x_true vs x_pred）
-    # ============================
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    # サンプリング（大規模メッシュ対応）
-    if N > MAX_POINTS_3D_SCATTER:
-        idx = np.random.choice(N, size=MAX_POINTS_3D_SCATTER, replace=False)
-    else:
-        idx = np.arange(N)
-
-    # 散布図
-    axes[0].scatter(x_true_centered[idx], x_pred_centered[idx], s=1, alpha=0.3, c='blue')
-
-    # 45度線
-    lim_min = min(x_true_centered[idx].min(), x_pred_centered[idx].min())
-    lim_max = max(x_true_centered[idx].max(), x_pred_centered[idx].max())
-    axes[0].plot([lim_min, lim_max], [lim_min, lim_max], 'r-', lw=2, label='y=x (理想)')
-
-    # 回帰直線
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        if np.std(x_true_centered[idx]) > 0:
-            coef = np.polyfit(x_true_centered[idx], x_pred_centered[idx], 1)
-            poly = np.poly1d(coef)
-            x_line = np.linspace(lim_min, lim_max, 100)
-            axes[0].plot(x_line, poly(x_line), 'g--', lw=1.5,
-                        label=f'回帰: y={coef[0]:.4f}x+{coef[1]:.2e}')
-
-    axes[0].set_xlabel("x_true (ゲージ補正済み)")
-    axes[0].set_ylabel("x_pred (ゲージ補正済み)")
-    axes[0].set_title("真値 vs 予測値")
-    axes[0].legend(loc='upper left')
-    axes[0].set_aspect('equal', adjustable='box')
-    axes[0].grid(True, alpha=0.3)
-
-    # 差分のヒストグラム
-    axes[1].hist(diff, bins=100, density=True, alpha=0.7, color='steelblue', edgecolor='black')
-    axes[1].axvline(0, color='red', linestyle='--', lw=2, label='ゼロ')
-    axes[1].axvline(np.mean(diff), color='green', linestyle='-', lw=2,
-                   label=f'平均: {np.mean(diff):.2e}')
-    axes[1].set_xlabel("差分 (x_pred - x_true)")
-    axes[1].set_ylabel("確率密度")
-    axes[1].set_title(f"差分ヒストグラム (std={np.std(diff):.2e})")
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    # 相関係数とRMSEを注記
-    if np.std(x_true_centered) > 0 and np.std(x_pred_centered) > 0:
-        corr = np.corrcoef(x_true_centered, x_pred_centered)[0, 1]
-    else:
-        corr = float('nan')
-    rmse = np.sqrt(np.mean(diff**2))
-    rel_err = np.linalg.norm(diff) / (np.linalg.norm(x_true_centered) + 1e-12)
-
-    fig.suptitle(f"予測精度評価 ({prefix}): R={corr:.4f}, RMSE={rmse:.2e}, RelErr={rel_err:.2%}", fontsize=12)
-    fig.tight_layout()
-
-    out_scatter = os.path.join(output_dir, f"scatter_comparison_{prefix}.png")
-    fig.savefig(out_scatter, dpi=200)
-    plt.close(fig)
-    log_print(f"    [PLOT] 散布図・ヒストグラムを {out_scatter} に保存しました。")
 
 
 # ------------------------------------------------------------
@@ -1427,7 +1137,6 @@ def train_gnn_auto_trainval_pde_weighted(
     *,
     enable_plot: bool = True,
     return_history: bool = False,
-    enable_error_plots: bool = False,  # ★ 追加：誤差場プロットを出すかどうか
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -2164,9 +1873,6 @@ def train_gnn_auto_trainval_pde_weighted(
     log_print("\n=== Final diagnostics (train cases) ===")
     model.eval()
 
-    # ★ ここでカウンタを初期化（関数のこのスコープ内）
-    num_error_plots_train = 0
-
     for cs in cases_train:
         time_str   = cs["time"]
         rank_str   = cs["rank"]
@@ -2326,13 +2032,6 @@ def train_gnn_auto_trainval_pde_weighted(
             })
             log_print(f"    [INFO] 比較VTK を {vtk_compare_path} に書き出しました。")
 
-        # ★ 誤差場の可視化（train ケース、x_true がある場合のみ）
-        if enable_error_plots and has_x_true and x_true is not None and num_error_plots_train < MAX_ERROR_PLOT_CASES_TRAIN:
-            prefix = f"train_time{time_str}_rank{rank_str}"
-            save_error_field_plots(cs, x_pred, x_true, prefix)
-            save_pressure_comparison_plots(cs, x_pred, x_true, prefix)
-            num_error_plots_train += 1
-
         # 遅延ロードの場合、GPU メモリを解放
         if USE_LAZY_LOADING:
             del cs_gpu
@@ -2341,9 +2040,6 @@ def train_gnn_auto_trainval_pde_weighted(
 
     if num_val > 0:
         log_print("\n=== Final diagnostics (val cases) ===")
-
-        # ★ val 側のカウンタもここで初期化
-        num_error_plots_val = 0
 
         for cs in cases_val:
             time_str   = cs["time"]
@@ -2502,13 +2198,6 @@ def train_gnn_auto_trainval_pde_weighted(
                     "error": error_np
                 })
                 log_print(f"    [INFO] 比較VTK を {vtk_compare_path} に書き出しました。")
-
-            # ★ 誤差場の可視化（val ケース、x_true がある場合のみ）
-            if enable_error_plots and has_x_true and x_true is not None and num_error_plots_val < MAX_ERROR_PLOT_CASES_VAL:
-                prefix = f"val_time{time_str}_rank{rank_str}"
-                save_error_field_plots(cs, x_pred, x_true, prefix)
-                save_pressure_comparison_plots(cs, x_pred, x_true, prefix)
-                num_error_plots_val += 1
 
             # 遅延ロードの場合、GPU メモリを解放
             if USE_LAZY_LOADING:
